@@ -1,0 +1,46 @@
+{
+  "meta": {
+    "top_k_recall": 6,
+    "top_k_rerank": 3,
+    "chunk_size": 700,
+    "overlap": 120
+  },
+  "metrics": {
+    "sample_count": 2,
+    "chunk_recall": 1.0,
+    "answer_accuracy": 1.0,
+    "hallucination_rate": 0.0
+  },
+  "details": [
+    {
+      "question": "消费是由什么决定的？",
+      "expected_answer": "消费是由生产决定的",
+      "model_answer": "消费是由生产决定的，生产决定消费的对象和消费的方式。没有生产，也就没有消费资料；生产规定着消费的方式；生产还引起对某种消费品的需要。同时，消费也从两方面制约着生产：一方面，消费使生产出来的产品得以最后完成其为产品；另一方面，消费还为生产创造出动力。消费又是推动生产发展的动力。",
+      "retrieved_chunk_ids": [
+        "efa52b56-0d3c-460b-bf1b-e26c4e94e533",
+        "e5aef328-6221-4db2-8585-ba8313985ad4",
+        "7355ca4d-820b-456a-bdb6-7d3c026b1bfb"
+      ],
+      "required_chunk_ids": [],
+      "all_required_hit": true,
+      "is_correct": 1,
+      "has_hallucination": 0,
+      "reason": "回答与标准答案一致，且基于参考上下文"
+    },
+    {
+      "question": "政治经济学所研究的生产关系是什么？",
+      "expected_answer": "研究的是人们以某种生产资料所有制为基础，在生产过程中形成的生产、分配、交换和消费关系即广义的生产关系",
+      "model_answer": "政治经济学所研究的生产关系，就是人们以某种生产资料所有制为基础，在生产过程中形成的生产、分配、交换和消费关系，即广义的生产关系。具体包括狭义的生产关系、分配关系、交换关系和消费关系。",
+      "retrieved_chunk_ids": [
+        "8286df0a-5f81-4124-a443-256271a71e01",
+        "7cbae1b8-d449-4f44-b186-9df7cc664ea6",
+        "59d05718-766c-4868-b5c8-3ff10c6e002d"
+      ],
+      "required_chunk_ids": [],
+      "all_required_hit": true,
+      "is_correct": 1,
+      "has_hallucination": 0,
+      "reason": "回答与标准答案一致，未添加额外信息"
+    }
+  ]
+}

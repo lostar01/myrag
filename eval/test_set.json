@@ -1,0 +1,12 @@
+[
+    {
+        "question": "消费是由什么决定的？",
+        "expected_answer": "消费是由生产决定的",
+        "required_chunk_ids": []
+    },
+    {
+        "question": "政治经济学所研究的生产关系是什么？",
+        "expected_answer": "研究的是人们以某种生产资料所有制为基础，在生产过程中形成的生产、分配、交换和消费关系即广义的生产关系",
+        "required_chunk_ids": []
+    }
+]

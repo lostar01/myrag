@@ -1,0 +1,6 @@
+docling
+qdrant-client
+sentence_transformers
+tiktoken
+psycopg2
+qdrant_client
