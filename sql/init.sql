@@ -101,4 +101,16 @@ CREATE TABLE IF NOT EXISTS chat_message (
 );
 CREATE INDEX idx_msg_chat_id ON chat_message(chat_id);
 
-
+-- 用户表（注册/登录）
+CREATE TABLE IF NOT EXISTS rag_user (
+    user_id VARCHAR(64) PRIMARY KEY,
+    username VARCHAR(64) UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    nickname TEXT,
+    role VARCHAR(16) DEFAULT 'user', -- user / admin
+    status VARCHAR(16) DEFAULT 'active', -- active / disabled
+    created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
+    meta JSONB DEFAULT '{}'::jsonb
+);
+CREATE INDEX idx_rag_user_username ON rag_user(username);
