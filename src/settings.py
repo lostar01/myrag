@@ -22,10 +22,14 @@ class EmbeddingSettings(BaseSettings):
     model_name: Path
     local_files_only: bool
     device: str = "cuda"
+    embed_url: str
+    embed_health_url: str
 
 class RerankSettings(BaseSettings):
     model_name: Path
     local_files_only: bool
+    rerank_url: str
+    rerank_health_url: str
 
 class LlmSettings(BaseSettings):
     base_url: str

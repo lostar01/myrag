@@ -7,7 +7,8 @@ from pg_store import pg_store
 from qdrant_store import qdrant_store
 from docling_parser import doc_parser
 from markdown_preprocessor import process_markdown_to_chunks, ChunkItem
-from embedding_service import embedding_service
+# from embedding_service import embedding_service
+from embedding_client import embedding_client
 
 
 def calc_file_md5(file_path: str) -> str:
@@ -66,7 +67,9 @@ class DocManager:
             )
 
             if chunks:
-                embeddings = embedding_service.encode([ck.content_md for ck in chunks])
+                # embeddings = embedding_service.encode([ck.content_md for ck in chunks])
+                text_list = [ck.content_md for ck in chunks]
+                embeddings = embedding_client.embed_texts(text_list)
                 self.pg.batch_insert(chunks)
                 self.qdrant.batch_insert(chunks, embeddings)
 
