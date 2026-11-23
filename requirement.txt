@@ -2,5 +2,14 @@ docling
 qdrant-client
 sentence_transformers
 tiktoken
-psycopg2
+psycopg2-binary
 qdrant_client
+fastapi
+uvicorn[standard]
+python-multipart
+celery
+redis
+openai
+pydantic-settings
+pyyaml
+requests

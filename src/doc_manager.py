@@ -66,21 +66,30 @@ class DocManager:
                 source_path=str(file_path)
             )
 
+            # 先算 embedding（外部调用，放在事务外，避免长事务占用连接）
+            embeddings = []
             if chunks:
-                # embeddings = embedding_service.encode([ck.content_md for ck in chunks])
                 text_list = [ck.content_md for ck in chunks]
                 embeddings = embedding_client.embed_texts(text_list)
-                self.pg.batch_insert(chunks)
-                self.qdrant.batch_insert(chunks, embeddings)
 
             sql_insert_doc = """
             INSERT INTO rag_doc(doc_id, doc_name, file_path, file_md5, page_count, meta, status)
             VALUES (%s, %s, %s, %s, %s, %s, %s)
             """
-            self.pg.execute(sql_insert_doc, (
-                doc_id, doc_name, file_path, file_md5, page_count,
-                Json({"table_count": len(tables)}), "success"
-            ))
+
+            # PG 写入放在同一事务：chunk + doc 原子提交，任一失败整体回滚
+            with self.pg.transaction() as conn:
+                if chunks:
+                    self.pg.batch_insert(chunks, conn=conn)
+                with conn.cursor() as cur:
+                    cur.execute(sql_insert_doc, (
+                        doc_id, doc_name, file_path, file_md5, page_count,
+                        Json({"table_count": len(tables)}), "success"
+                    ))
+
+            # PG 事务提交成功后再写 Qdrant（向量库无事务，放最后降低不一致概率）
+            if chunks:
+                self.qdrant.batch_insert(chunks, embeddings)
 
             return {
                 "doc_id": doc_id,
@@ -89,12 +98,17 @@ class DocManager:
                 "msg": f"文档 {doc_name} 入库完成"
             }
         except Exception as e:
+            # PG 事务已自动回滚；清理可能已写入的 Qdrant 向量，避免脏数据
+            try:
+                self.qdrant.delete_by_doc_id(doc_id)
+            except Exception:
+                pass
+            # 记录失败状态（独立事务）
             sql_insert_doc = """
             INSERT INTO rag_doc(doc_id, doc_name, file_path, file_md5, page_count, meta, status)
             VALUES (%s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT(doc_id) DO UPDATE SET status='failed'
             """
-            # ✅ 这里也包 Json
             self.pg.execute(sql_insert_doc, (
                 doc_id, doc_name, file_path, file_md5, 0, Json({"error": str(e)}), "failed"
             ))

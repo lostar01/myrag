@@ -17,4 +17,8 @@ class LLMService:
         )
         return resp.choices[0].message.content
 
+    def simple_call(self, prompt: str, temperature: float = 0.0):
+        """轻量单轮调用，用于 Query Rewrite 等辅助场景"""
+        return self.chat(prompt, temperature=temperature)
+
 llm_service = LLMService()
