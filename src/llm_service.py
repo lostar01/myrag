@@ -21,4 +21,20 @@ class LLMService:
         """轻量单轮调用，用于 Query Rewrite 等辅助场景"""
         return self.chat(prompt, temperature=temperature)
 
+    def chat_stream(self, prompt: str, temperature: float = 0.1):
+        """流式调用，逐 token yield 文本增量，用于 SSE 流式输出"""
+        stream = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temperature,
+            stream=True,
+        )
+        for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            content = getattr(delta, "content", None)
+            if content:
+                yield content
+
 llm_service = LLMService()
