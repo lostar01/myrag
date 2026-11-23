@@ -19,3 +19,4 @@ src/*.log
 src/*.bak
 src/*.swp
 src/upload_cache/*
+.vscode/*

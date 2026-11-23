@@ -15,12 +15,14 @@ def retrieve(query: str, top_k: int = 5) -> List[Dict]:
         limit=top_k,
         with_payload=True
     )
+    # 批量拉取完整内容，避免 N+1 查询
+    chunk_ids = [p.payload["chunk_id"] for p in resp.points]
+    chunk_map = pg_store.get_chunks_by_ids(chunk_ids)
+
     out = []
     for point in resp.points:
-        payload = point.payload
-        chunk_id = payload["chunk_id"]
-        # 用chunk_id去PG拉完整内容
-        chunk_full = pg_store.get_chunk_by_id(chunk_id)
+        chunk_id = point.payload["chunk_id"]
+        chunk_full = chunk_map.get(chunk_id)
         if not chunk_full:
             continue
         out.append({
