@@ -35,6 +35,8 @@ embedding:
   local_files_only: True
    # 使用cuda还是cpu
   device: "cuda"
+  embed_url: "http://172.27.18.108:8080/embed"
+  embed_health_url: "http://172.27.18.108:8080/health"
   
 
 # rerank模块
@@ -43,6 +45,8 @@ rerank:
   model_name: "D:/models/bge-reranker-v2-m3"
   # 是否只处理本地文件，true则不处理url
   local_files_only: True
+  rerank_url: "http://172.27.18.108:8081/rerank"
+  rerank_health_url: "http://172.27.18.108:8081/health"
 
 # llm 模块
 llm:

@@ -1,5 +1,6 @@
 from typing import List, Dict
-from embedding_service import embedding_service
+# from embedding_service import embedding_service
+from embedding_client import embedding_client
 from qdrant_store import qdrant_store
 from pg_store import pg_store
 import logging
@@ -7,7 +8,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 def retrieve(query: str, top_k: int = 5) -> List[Dict]:
-    query_vec = embedding_service.encode(query)
+    query_vec = embedding_client.embed_text(query)
     resp = qdrant_store.client.query_points(
         collection_name=qdrant_store.collection_name,
         query=query_vec,

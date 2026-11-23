@@ -1,5 +1,5 @@
 from retrieval import retrieve
-from rerank_service import rerank_service
+from rerank_client import rerank_client
 from llm_service import llm_service
 from qa_log_service import qa_log_service
 from chat_store import chat_store
@@ -25,7 +25,7 @@ def chat_qa(chat_id: str, query: str):
 
     # 2. 召回 + 重排（和你原有逻辑不变）
     recall_chunks = retrieve(query_for_search, top_k=top_k_recall)
-    rerank_chunks = rerank_service.rerank(query_for_search, recall_chunks, top_n=top_k_rerank)
+    rerank_chunks = rerank_client.rerank(query_for_search, recall_chunks, top_n=top_k_rerank)
     chunk_ids = [c["chunk_id"] for c in rerank_chunks]
 
     # 3. 构造上下文参考

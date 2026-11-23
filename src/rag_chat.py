@@ -1,5 +1,6 @@
 from retrieval import retrieve
-from rerank_service import rerank_service
+# from rerank_service import rerank_service
+from rerank_client import rerank_client
 from llm_service import llm_service
 from qa_log_service import qa_log_service
 import time
@@ -35,7 +36,7 @@ def rag_chat(query: str):
     if not chunks:
         return {"answer": "知识库未找到相关内容", "sources": []}
     # 2.重排
-    chunks = rerank_service.rerank(query, chunks, top_n=top_k_rerank)
+    chunks = rerank_client.rerank(query, chunks, top_n=top_k_rerank)
 
     # 获取 chunk_ids 和 doc_ids
     chunk_ids = [item["chunk_id"] for item in chunks]
@@ -73,7 +74,7 @@ def rag_chat(query: str):
 
 # 测试
 if __name__ == "__main__":
-    result = rag_chat("经济的要素是什么？")
+    result = rag_chat("社会的阶层是怎么样的？")
     print("回答：", result["answer"])
     print("引用来源：")
     for s in result["sources"]:
