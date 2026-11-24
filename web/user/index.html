@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RAG 知识库助手</title>
+  <link rel="stylesheet" href="../style.css" />
+</head>
+<body>
+  <!-- 主应用（未登录会被重定向到 ../index.html 统一入口） -->
+  <div id="app-view" class="app-view hidden">
+    <!-- 侧边栏 -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-header">
+        <button class="new-chat-btn" id="new-chat-btn">
+          <span>＋</span> 新建对话
+        </button>
+      </div>
+
+      <div class="sidebar-section-title">对话历史</div>
+      <div class="session-list" id="session-list"></div>
+
+      <div class="sidebar-footer">
+        <button class="nav-btn" id="docs-btn">📄 文件上传</button>
+        <div class="user-menu">
+          <button
+            class="user-info"
+            id="user-menu-btn"
+            type="button"
+            aria-haspopup="menu"
+            aria-expanded="false"
+          >
+            <span class="user-avatar" id="user-avatar">U</span>
+            <span class="user-meta">
+              <span class="user-name" id="user-name">用户</span>
+              <span class="user-role" id="user-role"></span>
+            </span>
+            <span class="user-caret">▲</span>
+          </button>
+          <div class="user-menu-pop hidden" id="user-menu-pop" role="menu">
+            <a
+              class="user-menu-item admin-link hidden"
+              id="admin-link"
+              href="../admin/index.html"
+              role="menuitem"
+            >
+              🛠 管理端
+            </a>
+            <button class="user-menu-item" id="change-pwd-btn" role="menuitem" type="button">
+              🔑 修改密码
+            </button>
+            <button class="user-menu-item danger" id="logout-btn" role="menuitem" type="button">
+              ⏻ 退出登录
+            </button>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- 主内容区 -->
+    <main class="main" id="main">
+      <!-- 聊天视图 -->
+      <div class="chat-view" id="chat-view">
+        <header class="chat-header">
+          <button class="menu-toggle" id="menu-toggle">☰</button>
+          <div class="chat-title" id="chat-title">新对话</div>
+        </header>
+
+        <div class="messages" id="messages">
+          <div class="welcome" id="welcome">
+            <div class="welcome-logo">📚</div>
+            <h2>有什么可以帮你的？</h2>
+            <p>基于知识库文档，为你提供有依据的回答</p>
+          </div>
+        </div>
+
+        <div class="composer">
+          <div class="composer-inner">
+            <textarea id="input" rows="1" placeholder="输入你的问题…（Enter 发送，Shift+Enter 换行）"></textarea>
+            <button class="send-btn" id="send-btn" title="发送">➤</button>
+          </div>
+          <div class="composer-hint">回答基于知识库检索，仅供参考</div>
+        </div>
+      </div>
+
+      <!-- 文件视图（上传 + 只读列表） -->
+      <div class="docs-view hidden" id="docs-view">
+        <header class="chat-header">
+          <button class="menu-toggle" id="docs-menu-toggle">☰</button>
+          <div class="chat-title">文件</div>
+          <button class="btn-small header-right" id="back-chat-btn">← 返回对话</button>
+        </header>
+        <div class="docs-body">
+          <div class="upload-zone" id="upload-zone">
+            <input type="file" id="file-input" hidden />
+            <div class="upload-icon">⬆</div>
+            <div class="upload-text">点击或拖拽文件到此处上传</div>
+            <div class="upload-sub">支持 PDF 等文档，后台异步解析入库</div>
+          </div>
+          <div class="upload-progress hidden" id="upload-progress"></div>
+
+          <div class="docs-list-header">
+            <span>知识库文档（全部用户共享）</span>
+            <button class="refresh-btn" id="refresh-docs">刷新</button>
+          </div>
+          <div class="docs-list" id="docs-list"></div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- 通用弹窗 -->
+  <div class="modal-overlay hidden" id="modal-overlay">
+    <div class="modal" id="modal">
+      <div class="modal-header">
+        <h3 id="modal-title">标题</h3>
+        <button class="modal-close" id="modal-close">✕</button>
+      </div>
+      <div class="modal-body" id="modal-body"></div>
+      <div class="modal-footer" id="modal-footer"></div>
+    </div>
+  </div>
+
+  <script src="../common.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
