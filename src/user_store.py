@@ -8,6 +8,8 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
+from psycopg2.extras import RealDictCursor
+
 from pg_store import pg_store
 
 
@@ -113,15 +115,20 @@ class UserStore:
         """创建用户，返回不含密码哈希的用户信息。用户名重复会抛异常。"""
         user_id = uuid.uuid4().hex
         password_hash = hash_password(password)
-        row = pg_store.query_one(
-            f"""
-            INSERT INTO rag_user (user_id, username, password_hash, nickname, role)
-            VALUES (%s, %s, %s, %s, %s)
-            RETURNING {_USER_PUBLIC_COLS}
-            """,
-            (user_id, username, password_hash, nickname or username, role),
-        )
-        return row
+        # 注意：query_one 只用于 SELECT，内部不会 commit。
+        # INSERT ... RETURNING 必须放在会提交的事务里，否则数据不会真正落库。
+        with pg_store.transaction() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    f"""
+                    INSERT INTO rag_user (user_id, username, password_hash, nickname, role)
+                    VALUES (%s, %s, %s, %s, %s)
+                    RETURNING {_USER_PUBLIC_COLS}
+                    """,
+                    (user_id, username, password_hash, nickname or username, role),
+                )
+                row = cur.fetchone()
+        return dict(row) if row else None
 
     def authenticate(self, username: str, password: str) -> Optional[Dict[str, Any]]:
         """校验用户名密码，成功返回用户信息（不含密码哈希），失败返回 None"""
@@ -167,6 +174,16 @@ class UserStore:
             tuple(params),
         )
         return self.get_by_id(user_id)
+
+    def change_password(self, user_id: str, new_password: str) -> bool:
+        """修改密码，返回是否更新成功（用户不存在返回 False）"""
+        if not self.get_by_id(user_id):
+            return False
+        pg_store.execute(
+            "UPDATE rag_user SET password_hash = %s, updated_at = NOW() WHERE user_id = %s",
+            (hash_password(new_password), user_id),
+        )
+        return True
 
     def delete_user(self, user_id: str) -> None:
         pg_store.execute("DELETE FROM rag_user WHERE user_id = %s", (user_id,))

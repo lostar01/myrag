@@ -26,9 +26,39 @@ class DocManager:
         self.qdrant = qdrant_store
 
     def is_file_exist(self, file_md5: str) -> Optional[dict]:
-        """根据md5判断文档是否已经入库，存在返回doc信息"""
-        sql = "SELECT * FROM rag_doc WHERE file_md5 = %s LIMIT 1;"
+        """根据md5判断文档是否已经**成功**入库，存在返回doc信息。
+
+        注意：只有 status='success' 的记录才参与幂等判断。
+        历史失败记录（status='failed'）必须允许重新入库，否则 Celery 重试时
+        会命中失败记录直接返回 skipped，导致任务被误标记为 success 而实际无数据。
+        """
+        sql = "SELECT * FROM rag_doc WHERE file_md5 = %s AND status = 'success' LIMIT 1;"
         return self.pg.query_one(sql, (file_md5,))
+
+    def _cleanup_doc_data(self, doc_id: str):
+        """尽力清理某个 doc_id 的向量与 chunk，不抛异常（清理本身不应掩盖原始错误）。"""
+        try:
+            self.qdrant.delete_by_doc_id(doc_id)
+        except Exception as e:
+            print(f"[doc_manager] 清理 Qdrant 向量失败 doc_id={doc_id}: {e}")
+        try:
+            self.pg.delete_by_doc_id(doc_id)
+        except Exception as e:
+            print(f"[doc_manager] 清理 PG chunk 失败 doc_id={doc_id}: {e}")
+
+    def _purge_failed_attempts(self, file_md5: str):
+        """清理同一 md5 的历史失败记录及其残留数据，保证同一文件只保留一条失败记录。"""
+        try:
+            rows = self.pg.query_all(
+                "SELECT doc_id FROM rag_doc WHERE file_md5 = %s AND status = 'failed'",
+                (file_md5,),
+            )
+            for row in rows:
+                self._cleanup_doc_data(row["doc_id"])
+                self.pg.execute("DELETE FROM rag_doc WHERE doc_id = %s", (row["doc_id"],))
+        except Exception as e:
+            # 清理失败不应阻断本次重新入库
+            print(f"[doc_manager] 清理历史失败记录失败 md5={file_md5}: {e}")
 
     def add_document(self, file_path: str, file_name: str, page_range: Optional[Tuple[int, int]] = None) -> dict:
         """
@@ -47,6 +77,10 @@ class DocManager:
                 "chunks": 0,
                 "msg": f"文件 {doc_name} 已存在，md5:{file_md5}"
             }
+
+        # 重新入库前清理同一文件的失败残留（失败记录 + 可能残留的 chunk/向量），
+        # 否则重试会不断堆积 failed 记录与孤儿数据。
+        self._purge_failed_attempts(file_md5)
 
         # 生成文档唯一ID
         doc_id = str(uuid.uuid4())
@@ -98,21 +132,27 @@ class DocManager:
                 "msg": f"文档 {doc_name} 入库完成"
             }
         except Exception as e:
-            # PG 事务已自动回滚；清理可能已写入的 Qdrant 向量，避免脏数据
+            # 失败清理：向量库无事务；且“PG 已提交、Qdrant 写入失败”这一分支下
+            # chunk 已经落库，只删向量会留下孤儿 chunk。因此这里必须把本次 doc_id 的
+            # 向量与 PG chunk 一并清理，再写一条 failed 记录（不参与幂等判断，重试时会被清掉）。
+            self._cleanup_doc_data(doc_id)
             try:
-                self.qdrant.delete_by_doc_id(doc_id)
-            except Exception:
-                pass
-            # 记录失败状态（独立事务）
-            sql_insert_doc = """
-            INSERT INTO rag_doc(doc_id, doc_name, file_path, file_md5, page_count, meta, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT(doc_id) DO UPDATE SET status='failed'
-            """
-            self.pg.execute(sql_insert_doc, (
-                doc_id, doc_name, file_path, file_md5, 0, Json({"error": str(e)}), "failed"
-            ))
-            raise e
+                sql_insert_doc = """
+                INSERT INTO rag_doc(doc_id, doc_name, file_path, file_md5, page_count, meta, status)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT(doc_id) DO UPDATE SET
+                    status    = 'failed',
+                    page_count = 0,
+                    meta      = EXCLUDED.meta,
+                    updated_at = NOW()
+                """
+                self.pg.execute(sql_insert_doc, (
+                    doc_id, doc_name, file_path, file_md5, 0, Json({"error": str(e)}), "failed"
+                ))
+            except Exception as log_err:
+                # 失败记录写不进去不应吞掉原始异常
+                print(f"[doc_manager] 写入失败状态出错 doc_id={doc_id}: {log_err}")
+            raise
 
     def delete_document(self, doc_id: str):
         """
