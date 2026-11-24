@@ -21,7 +21,7 @@
       <div class="session-list" id="session-list"></div>
 
       <div class="sidebar-footer">
-        <button class="nav-btn" id="docs-btn">📄 文件上传</button>
+        <button class="nav-btn" id="docs-btn">📤 上传记录</button>
         <div class="user-menu">
           <button
             class="user-info"
@@ -83,11 +83,11 @@
         </div>
       </div>
 
-      <!-- 文件视图（上传 + 只读列表） -->
+      <!-- 上传记录视图（上传 + 我的上传记录） -->
       <div class="docs-view hidden" id="docs-view">
         <header class="chat-header">
           <button class="menu-toggle" id="docs-menu-toggle">☰</button>
-          <div class="chat-title">文件</div>
+          <div class="chat-title">上传记录</div>
           <button class="btn-small header-right" id="back-chat-btn">← 返回对话</button>
         </header>
         <div class="docs-body">
@@ -100,10 +100,22 @@
           <div class="upload-progress hidden" id="upload-progress"></div>
 
           <div class="docs-list-header">
-            <span>知识库文档（全部用户共享）</span>
+            <span>我的上传记录</span>
             <button class="refresh-btn" id="refresh-docs">刷新</button>
           </div>
-          <div class="docs-list" id="docs-list"></div>
+          <div class="users-table-wrap">
+            <table class="users-table">
+              <thead>
+                <tr>
+                  <th>文件名</th>
+                  <th>页数</th>
+                  <th>状态</th>
+                  <th>上传时间</th>
+                </tr>
+              </thead>
+              <tbody id="docs-tbody"></tbody>
+            </table>
+          </div>
         </div>
       </div>
     </main>

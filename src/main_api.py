@@ -3,7 +3,9 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List
+import hashlib
 import os
+import time
 import uuid
 import json
 import queue
@@ -396,9 +398,60 @@ async def delete_session(chat_id: str, user: dict = Depends(get_current_user)):
 
 
 # ============ 文档 / 任务 / 问答 API ============
+def _duplicate_message(conflict: dict) -> str:
+    """按已存在记录的状态生成重复上传提示文案。"""
+    uploader = conflict.get("uploader") or "历史数据"
+    status = conflict.get("status")
+    if status in ("processing", "pending", "running"):
+        return f"该文件正在解析中（上传人：{uploader}），请稍后再试"
+    if status == "failed":
+        return (
+            f"该文件上次解析失败（上传人：{uploader}），"
+            "请管理员在「上传记录」中删除后重传"
+        )
+    return f"文件已存在（上传人：{uploader}），无需重复上传"
+
+
+# 惰性自愈节流：最多每 60 秒执行一次，避免每次列表请求都打 UPDATE
+_last_heal_at = 0.0
+HEAL_MIN_INTERVAL = 60.0
+
+
+def _heal_stale_if_due():
+    """超过 HEAL_MIN_INTERVAL 才跑一次 heal_stale_tasks，异常不影响列表查询。"""
+    global _last_heal_at
+    now = time.monotonic()
+    if now - _last_heal_at < HEAL_MIN_INTERVAL:
+        return
+    _last_heal_at = now
+    try:
+        healed = doc_manager.heal_stale_tasks()
+        if healed:
+            print(f"[uploads] 惰性自愈：{healed} 条超时任务已标记为 failed")
+    except Exception as e:
+        print(f"[uploads] 惰性自愈失败（不影响列表）：{e}")
+
+
+def _safe_unlink_upload(file_path: Optional[str]):
+    """只允许删除 upload_cache 目录下的源文件，避免路径穿越误删。"""
+    if not file_path:
+        return
+    try:
+        target = Path(file_path).resolve()
+        base = UPLOAD_DIR.resolve()
+        if target != base and base in target.parents:
+            target.unlink(missing_ok=True)
+    except Exception as e:
+        print(f"[upload] 删除源文件失败 path={file_path}: {e}")
+
+
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
-    """上传文档：校验后缀/大小 → 分块落盘 → 提交 Celery 异步解析任务。"""
+    """上传文档：校验后缀/大小 → 分块落盘（边写边算 md5）→ md5 查重 → 写上传记录 → 提交 Celery 任务。
+
+    rag_doc 已有该 md5（success / failed）或同 md5 正在解析时不提交任务，
+    需管理员在「上传记录」中删除记录后才能重新上传。
+    """
     # 1. 校验文件名与后缀
     original_name = (file.filename or "").strip()
     if not original_name:
@@ -417,10 +470,12 @@ async def upload_file(file: UploadFile = File(...), user: dict = Depends(get_cur
                    f"仅支持：{', '.join(sorted(ALLOWED_SUFFIXES))}",
         )
 
-    # 2. 分块落盘，避免大文件一次性读入内存，同时限制总大小
+    # 2. 分块落盘，避免大文件一次性读入内存，同时限制总大小；
+    #    边写边算 md5（不额外读一遍文件），供上传前查重使用
     save_name = f"{uuid.uuid4().hex}{suffix}"
     save_path = UPLOAD_DIR / save_name
     total = 0
+    md5 = hashlib.md5()
     try:
         with open(save_path, "wb") as f:
             while True:
@@ -433,9 +488,11 @@ async def upload_file(file: UploadFile = File(...), user: dict = Depends(get_cur
                         status_code=413,
                         detail=f"文件超过大小上限 {MAX_UPLOAD_SIZE // (1024 * 1024)}MB",
                     )
+                md5.update(chunk)
                 f.write(chunk)
         if total == 0:
             raise HTTPException(status_code=400, detail="上传的文件为空")
+        file_md5 = md5.hexdigest()
     except HTTPException:
         save_path.unlink(missing_ok=True)
         raise
@@ -445,22 +502,73 @@ async def upload_file(file: UploadFile = File(...), user: dict = Depends(get_cur
     finally:
         await file.close()
 
-    # 3. 提交 Celery 任务；失败则清理临时文件，避免残留
+    # 3. 上传前 md5 查重：rag_doc 已有该 md5 记录（任意状态）、或同 md5 正在解析，
+    #    都不提交任务。只有管理员在「上传记录」里删除记录后才能重新上传。
+    conflict = doc_manager.find_upload_conflict(file_md5)
+    if conflict:
+        save_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=409, detail=_duplicate_message(conflict))
+
+    # 4. 先占位 rag_doc（status=processing）+ 写上传记录（pending），列表立刻可见；
+    #    doc_id 在上传时确定，列表以 rag_doc 为准、其余信息由 doc_id 级联 rag_task，
+    #    Celery 任务 ID 与记录 ID 一致，worker 的回写才能落回同一行
+    doc_id = str(uuid.uuid4())
+    task_id = uuid.uuid4().hex
     try:
-        task = import_document_task.delay(
-            local_file_path=str(save_path),
-            file_name=original_name,
+        doc_manager.reserve_document(
+            doc_id=doc_id,
+            doc_name=original_name,
+            file_path=str(save_path),
+            file_md5=file_md5,
+            file_size=total,
         )
     except Exception as e:
         save_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"上传记录创建失败：{e}")
+
+    try:
+        task_store.create_task(
+            task_id=task_id,
+            doc_id=doc_id,
+            file_name=original_name,
+            file_path=str(save_path),
+            user_id=user["user_id"],
+            status="pending",
+        )
+    except Exception as e:
+        save_path.unlink(missing_ok=True)
+        doc_manager.mark_document_failed(doc_id, f"上传记录创建失败：{e}")
+        raise HTTPException(status_code=500, detail=f"上传记录创建失败：{e}")
+
+    try:
+        import_document_task.apply_async(
+            kwargs={
+                "local_file_path": str(save_path),
+                "file_name": original_name,
+                "doc_id": doc_id,
+            },
+            task_id=task_id,
+        )
+    except Exception as e:
+        # 提交失败也保留记录（失败保留），并清理临时文件
+        task_store.update_task(
+            task_id,
+            status="failed",
+            doc_id=doc_id,
+            error_msg=f"任务提交失败：{e}"[:500],
+            progress=0,
+        )
+        doc_manager.mark_document_failed(doc_id, f"任务提交失败：{e}")
+        save_path.unlink(missing_ok=True)
         raise HTTPException(status_code=503, detail=f"任务提交失败，请稍后重试：{e}")
 
-    task_store.update_task(task.id, status="pending")
     return {
-        "task_id": task.id,
+        "task_id": task_id,
+        "doc_id": doc_id,
         "msg": "任务已提交，后台解析入库",
         "file_name": original_name,
         "size": total,
+        "file_md5": file_md5,
     }
 
 @app.get("/task/{task_id}")
@@ -479,6 +587,53 @@ async def get_task_info(task_id: str, user: dict = Depends(get_current_user)):
         "error_msg": row["error_msg"],
         "progress": row["progress"]
     }
+
+@app.get("/uploads")
+async def list_upload_records(
+    limit: int = 100,
+    offset: int = 0,
+    user: dict = Depends(get_current_user),
+):
+    """上传记录列表：以 rag_doc 为准（一条 = 一篇文档），其余信息由 doc_id 级联 rag_task。
+
+    普通用户只看自己的，管理员看全部（含上传人与删除操作）。
+    """
+    uid = None if user.get("role") == "admin" else user["user_id"]
+    rows, total = doc_manager.list_upload_records(user_id=uid, limit=limit, offset=offset)
+    return {"total": total, "records": rows}
+
+
+@app.delete("/uploads/{record_id}")
+async def delete_upload_record(record_id: str, _admin: dict = Depends(require_admin)):
+    """删除上传记录（管理员）：以 rag_doc 为准，按 doc_id 清 chunk + 向量 + rag_doc + rag_task + 源文件。
+
+    删除后同一文件才能重新上传。record_id 就是 doc_id（兼容旧的 legacy:<doc_id> 写法）。
+    解析中（且未超时）的记录不允许删除。
+    """
+    doc_id = record_id[len("legacy:"):] if record_id.startswith("legacy:") else record_id
+
+    record = doc_manager.get_upload_record(doc_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="上传记录不存在")
+    # 解析中（且未超时）不允许删除，避免后台任务写回脏数据；卡死的记录（>30 分钟）可删
+    if record.get("is_active"):
+        raise HTTPException(status_code=409, detail="该记录正在解析中，完成后可删除")
+
+    doc_row = pg_store.query_one("SELECT file_path FROM rag_doc WHERE doc_id = %s", (doc_id,))
+    task_row = pg_store.query_one(
+        "SELECT file_path FROM rag_task WHERE doc_id = %s ORDER BY created_at DESC LIMIT 1",
+        (doc_id,),
+    )
+    file_path = (doc_row or {}).get("file_path") or (task_row or {}).get("file_path")
+
+    # 1. 先删任务行（否则 add_document 重试时还会回写已删的 doc_id）
+    pg_store.execute("DELETE FROM rag_task WHERE doc_id = %s", (doc_id,))
+    # 2. 再删 chunk / 向量 / rag_doc（复用已有的双删逻辑）
+    doc_manager.delete_document(doc_id)
+    # 3. 最后清 upload_cache 源文件
+    _safe_unlink_upload(file_path)
+    return {"doc_id": doc_id, "msg": "上传记录已删除，可重新上传"}
+
 
 @app.get("/documents")
 async def list_documents(
