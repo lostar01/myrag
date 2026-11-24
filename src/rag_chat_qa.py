@@ -4,7 +4,31 @@ from llm_service import llm_service
 from qa_log_service import qa_log_service
 from chat_store import chat_store
 from chat_window import chat_window
+from title_service import generate_title, is_placeholder_title
 import time
+
+
+def _should_autotitle(chat_id: str, has_history: bool) -> bool:
+    """只在「新会话的第一问」且标题还是占位值时自动命名。"""
+    if has_history:
+        return False
+    try:
+        session = chat_store.get_session(chat_id)
+    except Exception as e:
+        print(f"[rag_chat_qa] 读取会话失败，跳过自动命名 chat_id={chat_id}: {e}")
+        return False
+    return bool(session) and is_placeholder_title(session.get("title"))
+
+
+def _apply_title(chat_id: str, query: str):
+    """生成并写入会话标题，返回标题；任何异常不影响问答主流程。"""
+    try:
+        title = generate_title(query)
+        chat_store.update_session(chat_id, title=title)
+        return title
+    except Exception as e:
+        print(f"[rag_chat_qa] 自动命名会话失败 chat_id={chat_id}: {e}")
+        return None
 
 def chat_qa(chat_id: str, query: str):
     # 定义召回与重排数
@@ -12,10 +36,11 @@ def chat_qa(chat_id: str, query: str):
     top_k_rerank = 3
     
     t0 = time.time()
-    
+
     # 1. 读取历史 + 裁剪窗口
     raw_history = chat_store.list_messages(chat_id)
     history = chat_window.trim_history(raw_history)
+    autotitle = _should_autotitle(chat_id, has_history=bool(raw_history))
 
     # ========== Query Rewrite：多轮对话下把问题改写成独立可检索的问题 ==========
     if history:
@@ -42,12 +67,16 @@ def chat_qa(chat_id: str, query: str):
         # 空召回保护：避免后续 context 未定义 / 无意义调用 LLM
         chat_store.add_msg(chat_id, "user", query)
         chat_store.add_msg(chat_id, "assistant", "知识库中未找到相关内容")
-        return {
+        title = _apply_title(chat_id, query) if autotitle else None
+        result = {
             "chat_id": chat_id,
             "answer": "知识库中未找到相关内容",
             "history": chat_store.list_messages(chat_id),
             "sources": []
         }
+        if title:
+            result["title"] = title
+        return result
     rerank_chunks = rerank_client.rerank(query_for_search, recall_chunks, top_n=top_k_rerank)
     chunk_ids = [c["chunk_id"] for c in rerank_chunks]
 
@@ -107,12 +136,19 @@ def chat_qa(chat_id: str, query: str):
             "chat_id": chat_id
         }
     )
-    return {
+
+    # 7. 新会话的第一问：自动命名（失败不影响返回）
+    result = {
         "chat_id": chat_id,
         "answer": answer,
         "history": chat_store.list_messages(chat_id),
         "sources": rerank_chunks
     }
+    if autotitle:
+        title = _apply_title(chat_id, query)
+        if title:
+            result["title"] = title
+    return result
 
 def chat_qa_stream(chat_id: str, query: str):
     """流式问答：先做召回/重排/构造 prompt，再逐 token yield。
@@ -120,7 +156,8 @@ def chat_qa_stream(chat_id: str, query: str):
     yield 的事件为 dict：
       {"type": "sources", "sources": [...]}   # 首帧返回引用来源
       {"type": "delta", "content": "..."}      # 文本增量
-      {"type": "done", "answer": "...", "chat_id": ...}  # 结束
+      {"type": "done", "answer": "...", "chat_id": ...}  # 回答结束
+      {"type": "title", "title": "...", "chat_id": ...} # 仅新会话第一问：自动命名的标题
     """
     top_k_recall = 6
     top_k_rerank = 3
@@ -128,6 +165,7 @@ def chat_qa_stream(chat_id: str, query: str):
 
     raw_history = chat_store.list_messages(chat_id)
     history = chat_window.trim_history(raw_history)
+    autotitle = _should_autotitle(chat_id, has_history=bool(raw_history))
 
     # Query Rewrite
     if history:
@@ -154,7 +192,12 @@ def chat_qa_stream(chat_id: str, query: str):
         chat_store.add_msg(chat_id, "assistant", answer)
         yield {"type": "sources", "sources": []}
         yield {"type": "delta", "content": answer}
+        # 先发 done，再做自动命名：标题生成（LLM）不会拖慢回答的呈现
         yield {"type": "done", "answer": answer, "chat_id": chat_id}
+        if autotitle:
+            title = _apply_title(chat_id, query)
+            if title:
+                yield {"type": "title", "title": title, "chat_id": chat_id}
         return
 
     rerank_chunks = rerank_client.rerank(query_for_search, recall_chunks, top_n=top_k_rerank)
@@ -221,7 +264,13 @@ def chat_qa_stream(chat_id: str, query: str):
             "stream": True,
         },
     )
+
+    # 先发 done，再自动命名标题（LLM 调用不阻塞回答呈现）
     yield {"type": "done", "answer": answer, "chat_id": chat_id}
+    if autotitle:
+        title = _apply_title(chat_id, query)
+        if title:
+            yield {"type": "title", "title": title, "chat_id": chat_id}
 
 
 if __name__ == "__main__":

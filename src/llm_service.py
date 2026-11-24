@@ -9,17 +9,21 @@ class LLMService:
         )
         self.model = settings.llm.model_name
 
-    def chat(self, prompt: str, temperature: float = 0.1):
+    def chat(self, prompt: str, temperature: float = 0.1, max_tokens: int = None):
+        kwargs = {}
+        if max_tokens:
+            kwargs["max_tokens"] = max_tokens
         resp = self.client.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
             temperature=temperature,
+            **kwargs,
         )
         return resp.choices[0].message.content
 
-    def simple_call(self, prompt: str, temperature: float = 0.0):
-        """轻量单轮调用，用于 Query Rewrite 等辅助场景"""
-        return self.chat(prompt, temperature=temperature)
+    def simple_call(self, prompt: str, temperature: float = 0.0, max_tokens: int = None):
+        """轻量单轮调用，用于 Query Rewrite / 标题生成等辅助场景"""
+        return self.chat(prompt, temperature=temperature, max_tokens=max_tokens)
 
     def chat_stream(self, prompt: str, temperature: float = 0.1):
         """流式调用，逐 token yield 文本增量，用于 SSE 流式输出"""
