@@ -67,6 +67,7 @@
 
   // ---------------- 视图切换 ----------------
   function showUsersView() {
+    stopDocsAutoRefresh();
     hide($("docs-view"));
     show($("users-view"));
     $("users-btn").classList.add("active");
@@ -269,41 +270,109 @@
     ]);
   }
 
-  // ---------------- 文档管理 ----------------
-  async function loadDocuments() {
-    const list = $("docs-list");
-    list.innerHTML = `<div class="docs-loading">加载中…</div>`;
+  // ---------------- 上传记录（全部用户，可删除） ----------------
+  // 状态文案：pending / running 来自 rag_task，success / failed 为最终态
+  const STATUS_TEXT = {
+    pending: "等待解析",
+    running: "解析中",
+    processing: "解析中",
+    success: "成功",
+    failed: "失败",
+  };
+
+  function statusText(status) {
+    return STATUS_TEXT[status] || status || "未知";
+  }
+
+  // 有记录处于等待/解析中时，每 3s 静默刷新一次（离开视图停止）
+  let docsAutoTimer = null;
+
+  function stopDocsAutoRefresh() {
+    if (docsAutoTimer) {
+      clearTimeout(docsAutoTimer);
+      docsAutoTimer = null;
+    }
+  }
+
+  function scheduleDocsAutoRefresh(hasActive) {
+    stopDocsAutoRefresh();
+    if (!hasActive) return;
+    const view = $("docs-view");
+    if (view && view.classList.contains("hidden")) return;
+    docsAutoTimer = setTimeout(() => loadDocuments(true), 3000);
+  }
+
+  function renderDocRow(r) {
+    const tr = document.createElement("tr");
+    const status = r.status || "unknown";
+    // 文件名：绝不能用 doc_id / task_id 兜底（uuid 十六进制看起来像 md5，会让人误读）
+    const name = r.file_name || r.doc_name || "（未知文件名）";
+    const noName = !(r.file_name || r.doc_name);
+    // 失败原因：鼠标悬停在状态徽标上显示（后端已截断为 500 字）
+    const tip = status === "failed" && r.error_msg ? ` title="${escapeHtml(r.error_msg)}"` : "";
+    // 解析中不允许删除（避免后台任务写回脏数据）；is_active 由后端计算（超时卡死的记录可删）
+    const active = r.is_active === true;
+    tr.innerHTML = `
+      <td class="cell-username"${noName ? ` title="${escapeHtml(r.doc_id || "")}"` : ""}>${escapeHtml(
+      name
+    )}</td>
+      <td>${r.page_count != null ? escapeHtml(String(r.page_count)) : "-"}</td>
+      <td><span class="doc-status ${escapeHtml(status)}"${tip}>${escapeHtml(
+      statusText(status)
+    )}</span></td>
+      <td class="cell-time">${escapeHtml(formatTime(r.created_at))}</td>
+      <td class="cell-actions">
+        <button class="btn-small btn-danger" data-act="del" ${active ? "disabled" : ""} ${
+      active ? 'title="解析中，完成后可删除"' : ""
+    }>删除</button>
+      </td>
+    `;
+    const btn = tr.querySelector('[data-act="del"]');
+    if (btn && !active) btn.addEventListener("click", () => deleteUploadRecord(r));
+    return tr;
+  }
+
+  async function loadDocuments(silent) {
+    const tbody = $("docs-tbody");
+    if (!tbody) return;
+    if (!silent) {
+      tbody.innerHTML = `<tr><td colspan="5" class="users-loading">加载中…</td></tr>`;
+    }
     try {
-      const data = await api("/documents");
-      state.docs = data.documents || [];
+      const data = await api("/uploads");
+      state.docs = data.records || [];
+      const total = data.total != null ? data.total : state.docs.length;
+      $("docs-count").textContent = `共 ${total} 条上传记录`;
       if (!state.docs.length) {
-        list.innerHTML = `<div class="docs-empty">暂无文档，请上传</div>`;
+        tbody.innerHTML = `<tr><td colspan="5" class="users-empty">暂无上传记录</td></tr>`;
+        scheduleDocsAutoRefresh(false);
         return;
       }
-      list.innerHTML = "";
-      state.docs.forEach((d) => {
-        const row = document.createElement("div");
-        row.className = "doc-item";
-        const name = d.doc_name || d.title || d.doc_id;
-        const status = d.status || "unknown";
-        const metaParts = [];
-        if (d.page_count) metaParts.push(`${d.page_count} 页`);
-        metaParts.push(`更新于 ${formatTime(d.updated_at || d.created_at)}`);
-        row.innerHTML = `
-          <div class="doc-info">
-            <div class="doc-name">📄 ${escapeHtml(name)}</div>
-            <div class="doc-meta">${escapeHtml(metaParts.join(" · "))}</div>
-          </div>
-          <div class="doc-actions">
-            <span class="doc-status ${escapeHtml(status)}">${escapeHtml(status)}</span>
-            <button class="doc-del" title="删除">🗑</button>
-          </div>
-        `;
-        row.querySelector(".doc-del").addEventListener("click", () => deleteDocument(d));
-        list.appendChild(row);
-      });
+      tbody.innerHTML = "";
+      state.docs.forEach((r) => tbody.appendChild(renderDocRow(r)));
+      scheduleDocsAutoRefresh(state.docs.some((r) => r.is_active === true));
     } catch (err) {
-      list.innerHTML = `<div class="docs-empty">加载失败：${escapeHtml(err.message)}</div>`;
+      tbody.innerHTML = `<tr><td colspan="5" class="users-empty">加载失败：${escapeHtml(
+        err.message
+      )}</td></tr>`;
+      scheduleDocsAutoRefresh(false);
+    }
+  }
+
+  async function deleteUploadRecord(r) {
+    const name = r.file_name || r.doc_name || r.doc_id;
+    if (
+      !confirm(
+        `确定删除上传记录「${name}」？将同时清理向量数据与源文件，删除后可重新上传。`
+      )
+    )
+      return;
+    try {
+      // 记录以 rag_doc 为准，删除按 doc_id
+      await api(`/uploads/${encodeURIComponent(r.doc_id)}`, { method: "DELETE" });
+      loadDocuments();
+    } catch (err) {
+      alert("删除失败：" + err.message);
     }
   }
 
@@ -347,17 +416,6 @@
     }
   }
 
-  async function deleteDocument(doc) {
-    const name = doc.doc_name || doc.title || doc.doc_id;
-    if (!confirm(`确定删除文档「${name}」？将同时清理向量数据。`)) return;
-    try {
-      await api(`/documents/${doc.doc_id}`, { method: "DELETE" });
-      loadDocuments();
-    } catch (err) {
-      alert("删除失败：" + err.message);
-    }
-  }
-
   // ---------------- 事件绑定 ----------------
   function bindEvents() {
     $("logout-btn").addEventListener("click", logout);
@@ -367,7 +425,7 @@
     $("docs-btn").addEventListener("click", showDocsView);
     $("create-user-btn").addEventListener("click", openCreateUserModal);
     $("refresh-users").addEventListener("click", loadUsers);
-    $("refresh-docs").addEventListener("click", loadDocuments);
+    $("refresh-docs").addEventListener("click", () => loadDocuments());
 
     const zone = $("upload-zone");
     const fileInput = $("file-input");

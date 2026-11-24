@@ -34,7 +34,7 @@
       <div class="sidebar-section-title">管理</div>
       <div class="sidebar-nav">
         <button class="nav-btn active" id="users-btn">👥 用户管理</button>
-        <button class="nav-btn" id="docs-btn">📄 文档管理</button>
+        <button class="nav-btn" id="docs-btn">📤 上传记录</button>
       </div>
 
       <div class="sidebar-footer">
@@ -81,11 +81,11 @@
         </div>
       </div>
 
-      <!-- 文档管理 -->
+      <!-- 上传记录（全部用户，可删除） -->
       <div class="docs-view hidden" id="docs-view">
         <header class="chat-header">
           <button class="menu-toggle" id="docs-menu-toggle">☰</button>
-          <div class="chat-title">文档管理</div>
+          <div class="chat-title">上传记录</div>
         </header>
         <div class="docs-body">
           <div class="upload-zone" id="upload-zone">
@@ -97,10 +97,23 @@
           <div class="upload-progress hidden" id="upload-progress"></div>
 
           <div class="docs-list-header">
-            <span>已入库文档</span>
+            <span id="docs-count">全部上传记录</span>
             <button class="refresh-btn" id="refresh-docs">刷新</button>
           </div>
-          <div class="docs-list" id="docs-list"></div>
+          <div class="users-table-wrap">
+            <table class="users-table">
+              <thead>
+                <tr>
+                  <th>文件名</th>
+                  <th>页数</th>
+                  <th>状态</th>
+                  <th>上传时间</th>
+                  <th class="col-actions">操作</th>
+                </tr>
+              </thead>
+              <tbody id="docs-tbody"></tbody>
+            </table>
+          </div>
         </div>
       </div>
     </main>

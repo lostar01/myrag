@@ -335,6 +335,7 @@
 
   // ---------------- 视图切换 ----------------
   function showChatView() {
+    stopDocsAutoRefresh();
     show($("chat-view"));
     hide($("docs-view"));
   }
@@ -345,38 +346,81 @@
     loadDocuments();
   }
 
-  // ---------------- 文件（上传 + 只读列表） ----------------
-  async function loadDocuments() {
-    const list = $("docs-list");
-    list.innerHTML = `<div class="docs-loading">加载中…</div>`;
+  // ---------------- 上传记录（上传 + 我的上传记录） ----------------
+  // 状态文案：pending / running 来自 rag_task，success / failed 为最终态
+  const STATUS_TEXT = {
+    pending: "等待解析",
+    running: "解析中",
+    processing: "解析中",
+    success: "成功",
+    failed: "失败",
+  };
+
+  function statusText(status) {
+    return STATUS_TEXT[status] || status || "未知";
+  }
+
+  // 有记录处于等待/解析中时，每 3s 静默刷新一次（离开视图停止）
+  let docsAutoTimer = null;
+
+  function stopDocsAutoRefresh() {
+    if (docsAutoTimer) {
+      clearTimeout(docsAutoTimer);
+      docsAutoTimer = null;
+    }
+  }
+
+  function scheduleDocsAutoRefresh(hasActive) {
+    stopDocsAutoRefresh();
+    if (!hasActive) return;
+    const view = $("docs-view");
+    if (view && view.classList.contains("hidden")) return;
+    docsAutoTimer = setTimeout(() => loadDocuments(true), 3000);
+  }
+
+  function renderDocRow(r) {
+    const tr = document.createElement("tr");
+    const status = r.status || "unknown";
+    // 文件名：绝不能用 doc_id / task_id 兜底（uuid 十六进制看起来像 md5，会让人误读）
+    const name = r.file_name || r.doc_name || "（未知文件名）";
+    const noName = !(r.file_name || r.doc_name);
+    // 失败原因：鼠标悬停在状态徽标上显示（后端已截断为 500 字）
+    const tip = status === "failed" && r.error_msg ? ` title="${escapeHtml(r.error_msg)}"` : "";
+    tr.innerHTML = `
+      <td class="cell-username"${noName ? ` title="${escapeHtml(r.doc_id || "")}"` : ""}>${escapeHtml(
+      name
+    )}</td>
+      <td>${r.page_count != null ? escapeHtml(String(r.page_count)) : "-"}</td>
+      <td><span class="doc-status ${escapeHtml(status)}"${tip}>${escapeHtml(
+      statusText(status)
+    )}</span></td>
+      <td class="cell-time">${escapeHtml(formatTime(r.created_at))}</td>
+    `;
+    return tr;
+  }
+
+  async function loadDocuments(silent) {
+    const tbody = $("docs-tbody");
+    if (!tbody) return;
+    if (!silent) {
+      tbody.innerHTML = `<tr><td colspan="4" class="users-loading">加载中…</td></tr>`;
+    }
     try {
-      const data = await api("/documents");
-      const docs = data.documents || [];
-      if (!docs.length) {
-        list.innerHTML = `<div class="docs-empty">暂无文档，请上传</div>`;
+      const data = await api("/uploads");
+      const records = data.records || [];
+      if (!records.length) {
+        tbody.innerHTML = `<tr><td colspan="4" class="users-empty">暂无上传记录，请上传文件</td></tr>`;
+        scheduleDocsAutoRefresh(false);
         return;
       }
-      list.innerHTML = "";
-      docs.forEach((d) => {
-        const row = document.createElement("div");
-        row.className = "doc-item";
-        const name = d.doc_name || d.title || d.doc_id;
-        const metaParts = [];
-        if (d.updated_at || d.created_at) {
-          metaParts.push(`更新于 ${formatTime(d.updated_at || d.created_at)}`);
-        }
-        if (d.page_count) metaParts.push(`${d.page_count} 页`);
-        if (d.status) metaParts.push(`状态：${d.status}`);
-        row.innerHTML = `
-          <div class="doc-info">
-            <div class="doc-name">📄 ${escapeHtml(name)}</div>
-            <div class="doc-meta">${escapeHtml(metaParts.join(" · "))}</div>
-          </div>
-        `;
-        list.appendChild(row);
-      });
+      tbody.innerHTML = "";
+      records.forEach((r) => tbody.appendChild(renderDocRow(r)));
+      scheduleDocsAutoRefresh(records.some((r) => r.is_active === true));
     } catch (err) {
-      list.innerHTML = `<div class="docs-empty">加载失败：${escapeHtml(err.message)}</div>`;
+      tbody.innerHTML = `<tr><td colspan="4" class="users-empty">加载失败：${escapeHtml(
+        err.message
+      )}</td></tr>`;
+      scheduleDocsAutoRefresh(false);
     }
   }
 
@@ -525,7 +569,7 @@
     $("send-btn").addEventListener("click", sendMessage);
 
     // 文件
-    $("refresh-docs").addEventListener("click", loadDocuments);
+    $("refresh-docs").addEventListener("click", () => loadDocuments());
     const zone = $("upload-zone");
     const fileInput = $("file-input");
     zone.addEventListener("click", () => fileInput.click());

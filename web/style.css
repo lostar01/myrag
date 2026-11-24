@@ -778,6 +778,9 @@ input, textarea {
   border-radius: 20px;
   font-weight: 500;
   flex-shrink: 0;
+  /* 表格单元格窄时状态徽标会被拆成两行（“成 / 功”），强制不换行 */
+  white-space: nowrap;
+  display: inline-block;
 }
 
 .doc-status.success {

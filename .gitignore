@@ -21,3 +21,4 @@ src/*.swp
 src/upload_cache/*
 .vscode/*
 .pi/*
+plans/*
