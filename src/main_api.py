@@ -662,6 +662,7 @@ async def chat_stream(chat_id: str, query: str, user: dict = Depends(get_current
       {"type": "sources", "sources": [...]}
       {"type": "delta", "content": "..."}
       {"type": "done", "answer": "...", "chat_id": "..."}
+      {"type": "title", "title": "...", "chat_id": "..."}  # 仅新会话第一问：自动命名的标题（done 之后下发）
     """
     # 校验会话存在且归属当前用户（管理员可访问全部）
     session = chat_store.get_session(chat_id)

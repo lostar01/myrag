@@ -166,7 +166,11 @@
   function appendMessage(role, content) {
     const box = $("messages");
     const wrap = document.createElement("div");
-    wrap.className = `msg msg-${role}`;
+    // 注意：class 必须是 `msg user` / `msg assistant`（两个独立 class），
+    // CSS 里用的是 `.msg.user` / `.msg.assistant` 这种复合选择器；
+    // 写成 `msg-user` 会导致气泡 / 对齐 / 头像配色全部不生效。
+    wrap.className = `msg ${role}`;
+    wrap.dataset.role = role;
 
     // 头像
     const avatar = document.createElement("div");
@@ -194,6 +198,17 @@
     box.appendChild(wrap);
     scrollToBottom();
     return { wrap, bubble };
+  }
+
+  // 更新会话标题（后端在新会话第一问后自动命名，通过 SSE 的 title 事件下发）
+  function applySessionTitle(chatId, title) {
+    if (!chatId || !title) return;
+    const session = state.sessions.find((s) => s.chat_id === chatId);
+    if (session) session.title = title;
+    if (state.currentChatId === chatId) {
+      $("chat-title").textContent = title;
+    }
+    renderSessions();
   }
 
   async function sendMessage() {
@@ -326,6 +341,12 @@
       setAnswer(final);
       bubble.dataset.acc = final;
       bubble.innerHTML = renderMarkdown(final);
+      // 回答已结束：立即恢复输入，不等后续的 title 事件（标题生成可能慢）
+      state.streaming = false;
+      $("send-btn").disabled = false;
+    } else if (evt.type === "title") {
+      // 新会话第一问后自动命名的标题
+      applySessionTitle(evt.chat_id, evt.title);
     } else if (evt.type === "error") {
       bubble.innerHTML = `<span class="msg-error">出错了：${escapeHtml(
         evt.message || "未知错误"

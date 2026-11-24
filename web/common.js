@@ -33,20 +33,217 @@
     return String(str).replace(/[&<>"']/g, (ch) => HTML_ESCAPES[ch]);
   }
 
-  // 极简 Markdown 渲染（加粗、行内代码、代码块、换行）
-  function renderMarkdown(text) {
-    let html = escapeHtml(text);
-    // 代码块
-    html = html.replace(/```([\s\S]*?)```/g, (_, code) =>
-      `<pre class="code-block"><code>${code.trim()}</code></pre>`
+  // ---------------- Markdown 渲染 ----------------
+  // 无依赖的极简 Markdown -> HTML（块级）：标题 / 列表（嵌套）/ 代码块 / 引用 /
+  // 分隔线 / 表格 / 段落；行内：加粗、斜体、删除线、行内码、链接。
+  // 先 escapeHtml，再按行解析，不会执行任何用户输入的 HTML。
+
+  // 行内元素（输入必须已 escapeHtml）
+  function renderInline(text) {
+    let s = text;
+    s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
+    s = s.replace(/\*\*\*([^*]+)\*\*\*/g, "<strong><em>$1</em></strong>");
+    s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    s = s.replace(/~~([^~]+)~~/g, "<del>$1</del>");
+    s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+    s = s.replace(
+      /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+      '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>'
     );
-    // 行内代码
-    html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
-    // 加粗
-    html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-    // 换行
-    html = html.replace(/\n/g, "<br>");
+    return s;
+  }
+
+  // 列表：按缩进层级嵌套（2 空格/层，tab 视作 2 空格）
+  function renderList(items) {
+    let html = "";
+    const stack = []; // { ordered, indent, liOpen }
+    const closeItem = () => {
+      const top = stack[stack.length - 1];
+      if (top && top.liOpen) {
+        html += "</li>";
+        top.liOpen = false;
+      }
+    };
+    items.forEach((it) => {
+      while (stack.length && it.indent < stack[stack.length - 1].indent) {
+        closeItem();
+        const top = stack.pop();
+        html += top.ordered ? "</ol>" : "</ul>";
+      }
+      const top = stack[stack.length - 1];
+      if (!top || it.indent > top.indent) {
+        stack.push({ ordered: it.ordered, indent: it.indent, liOpen: false });
+        html += it.ordered
+          ? `<ol${it.num && it.num !== 1 ? ` start="${it.num}"` : ""}>`
+          : "<ul>";
+      } else if (top.ordered !== it.ordered) {
+        closeItem();
+        stack.pop();
+        html += top.ordered ? "</ol>" : "</ul>";
+        stack.push({ ordered: it.ordered, indent: it.indent, liOpen: false });
+        html += it.ordered ? "<ol>" : "<ul>";
+      } else {
+        closeItem();
+      }
+      html += `<li>${renderInline(escapeHtml(it.text))}`;
+      stack[stack.length - 1].liOpen = true;
+    });
+    while (stack.length) {
+      closeItem();
+      const top = stack.pop();
+      html += top.ordered ? "</ol>" : "</ul>";
+    }
     return html;
+  }
+
+  const RE_HEADING = /^ {0,3}(#{1,6})\s+(.*?)\s*#*\s*$/;
+  const RE_HR = /^ {0,3}([-*_])[ \t]*(\1[ \t]*){2,}$/;
+  const RE_QUOTE = /^ {0,3}>\s?(.*)$/;
+  const RE_ITEM = /^(\s*)([-*+]|\d{1,3}[.)])\s+(.*)$/;
+  const RE_TABLE_ROW = /^\s*\|.*\|\s*$/;
+  const RE_TABLE_SEP = /^\s*\|?[\s:|-]+\|?\s*$/;
+
+  function splitTableRow(line) {
+    return line
+      .trim()
+      .replace(/^\|/, "")
+      .replace(/\|$/, "")
+      .split("|")
+      .map((c) => c.trim());
+  }
+
+  function renderMarkdown(text) {
+    if (text == null) return "";
+    const lines = String(text).replace(/\r\n?/g, "\n").split("\n");
+    const out = [];
+    let para = [];
+
+    const flushPara = () => {
+      if (!para.length) return;
+      out.push(`<p>${para.map((l) => renderInline(escapeHtml(l))).join("<br>")}</p>`);
+      para = [];
+    };
+
+    let i = 0;
+    while (i < lines.length) {
+      const line = lines[i];
+
+      // 空行：段落结束
+      if (!line.trim()) {
+        flushPara();
+        i += 1;
+        continue;
+      }
+
+      // 代码块 ```lang
+      if (/^\s*```/.test(line)) {
+        flushPara();
+        const lang = line.trim().replace(/^```/, "").trim();
+        const code = [];
+        i += 1;
+        while (i < lines.length && !/^\s*```/.test(lines[i])) {
+          code.push(lines[i]);
+          i += 1;
+        }
+        i += 1; // 跳过结束 ```
+        const cls = lang ? ` class="language-${escapeHtml(lang)}"` : "";
+        out.push(`<pre class="code-block"><code${cls}>${escapeHtml(code.join("\n"))}</code></pre>`);
+        continue;
+      }
+
+      // 分隔线
+      if (RE_HR.test(line)) {
+        flushPara();
+        out.push("<hr>");
+        i += 1;
+        continue;
+      }
+
+      // 标题
+      const heading = line.match(RE_HEADING);
+      if (heading) {
+        flushPara();
+        const level = Math.min(heading[1].length, 6);
+        out.push(`<h${level}>${renderInline(escapeHtml(heading[2]))}</h${level}>`);
+        i += 1;
+        continue;
+      }
+
+      // 引用块（连续多行合并）
+      if (RE_QUOTE.test(line)) {
+        flushPara();
+        const quoted = [];
+        while (i < lines.length && RE_QUOTE.test(lines[i])) {
+          quoted.push(lines[i].match(RE_QUOTE)[1]);
+          i += 1;
+        }
+        out.push(
+          `<blockquote>${quoted.map((l) => renderInline(escapeHtml(l))).join("<br>")}</blockquote>`
+        );
+        continue;
+      }
+
+      // 表格（| a | b | + | --- | --- |）
+      if (RE_TABLE_ROW.test(line) && i + 1 < lines.length && RE_TABLE_SEP.test(lines[i + 1])) {
+        flushPara();
+        const head = splitTableRow(line);
+        i += 2;
+        const body = [];
+        while (i < lines.length && RE_TABLE_ROW.test(lines[i])) {
+          body.push(splitTableRow(lines[i]));
+          i += 1;
+        }
+        const th = head.map((c) => `<th>${renderInline(escapeHtml(c))}</th>`).join("");
+        const trs = body
+          .map(
+            (cells) =>
+              `<tr>${cells.map((c) => `<td>${renderInline(escapeHtml(c))}</td>`).join("")}</tr>`
+          )
+          .join("");
+        out.push(
+          `<div class="table-wrap"><table><thead><tr>${th}</tr></thead><tbody>${trs}</tbody></table></div>`
+        );
+        continue;
+      }
+
+      // 列表（连续列表项，可嵌套；列表项之间允许空行，与 CommonMark 一致）
+      if (RE_ITEM.test(line)) {
+        flushPara();
+        const items = [];
+        while (i < lines.length) {
+          if (RE_ITEM.test(lines[i])) {
+            const m = lines[i].match(RE_ITEM);
+            const indentStr = m[1].replace(/\t/g, "  ");
+            items.push({
+              indent: Math.floor(indentStr.length / 2),
+              ordered: /\d/.test(m[2]),
+              num: parseInt(m[2], 10) || 1,
+              text: lines[i].replace(RE_ITEM, "$3"),
+            });
+            i += 1;
+            continue;
+          }
+          // 空行后仍是列表项 → 跳过空行继续（loose list）
+          if (!lines[i].trim()) {
+            let j = i;
+            while (j < lines.length && !lines[j].trim()) j += 1;
+            if (j < lines.length && RE_ITEM.test(lines[j])) {
+              i = j;
+              continue;
+            }
+          }
+          break;
+        }
+        out.push(renderList(items));
+        continue;
+      }
+
+      // 普通段落行
+      para.push(line.trim());
+      i += 1;
+    }
+    flushPara();
+    return out.join("");
   }
 
   function formatTime(value) {
