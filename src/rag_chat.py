@@ -1,76 +1,61 @@
-from retrieval import retrieve
-# from rerank_service import rerank_service
-from rerank_client import rerank_client
-from llm_service import llm_service
-from qa_log_service import qa_log_service
+"""单轮问答的薄壳：不建会话、不写 chat_message，给 eval / 脚本用。
+
+产品链路走 `rag_chat_qa`（会话 + 历史 + 流式）。这里复用 `rag_prompt` 里同一套
+query rewrite / 召回 / 重排 / prompt（D7-b），这样 `rag_eval.py` 量到的就是线上
+那套 prompt，不再是另一份拷贝。
+
+与重构前的差异（有意）：
+  - prompt 多了「## 历史对话」段（单轮时为空），与线上完全一致；
+  - 多了按 token 预算裁剪参考资料（以前这条路径不裁剪）；
+  - 无可用资料时的固定回答统一成 rag_prompt.NO_ANSWER。
+"""
+
 import time
 
-def build_context_prompt(query: str, chunks):
-    context_lines = []
-    for item in chunks:
-        context_lines.append(
-            f"【章节路径】{item['section_path']} | 页码：{item['page_no']}\n"
-            f"{item['content']}"
-        )
-    context = "\n\n".join(context_lines)
+import rag_prompt
+from llm_service import llm_service
+from qa_log_service import qa_log_service
+from rag_prompt import DEFAULT_RECALL_TOP_K, DEFAULT_RERANK_TOP_K, NO_ANSWER
+from settings import settings
 
-    prompt = f"""你是专业知识库助手，请严格基于下面提供的参考资料回答用户问题。
-如果参考资料里没有对应的信息，直接回答“知识库中未找到相关内容”，禁止编造、臆测。
-
-## 参考资料
-{context}
-
-## 用户问题
-{query}
-"""
-    return prompt
 
 def rag_chat(query: str):
     t0 = time.time()
 
-    top_k_recall = 6
-    top_k_rerank = 3
+    # 召回 + 重排 + 组装 prompt（阈值为空时行为与重构前一致）
+    prepared = rag_prompt.prepare_answer(history=[], query=query)
+    if prepared is None:
+        return {"answer": NO_ANSWER, "sources": []}
 
-    # 1.向量粗召回
-    chunks = retrieve(query, top_k=top_k_recall)
-    if not chunks:
-        return {"answer": "知识库未找到相关内容", "sources": []}
-    # 2.重排
-    chunks = rerank_client.rerank(query, chunks, top_n=top_k_rerank)
-
-    # 获取 chunk_ids 和 doc_ids
-    chunk_ids = [item["chunk_id"] for item in chunks]
-    doc_ids = list({item["doc_id"] for item in chunks})
-    rerank_scores = [item["rerank_score"] for item in chunks]
-
-    if not chunks:
-        return {"answer": "知识库未找到相关内容", "sources": []}
-    # 3.构造prompt
-    prompt = build_context_prompt(query, chunks)
-    # 4.LLM生成
-    answer = llm_service.chat(prompt)
-
-    # 5.计时
+    sources = prepared.sources
+    answer = llm_service.chat(prepared.prompt)
     cost_ms = int((time.time() - t0) * 1000)
 
-    # 6.写入日志
-    log_id = qa_log_service.log_qa(
+    # 写入日志（与重构前同样的字段，方便 eval / 报表复用）
+    qa_log_service.log_qa(
         query=query,
         answer=answer,
-        chunk_ids=chunk_ids,
-        rerank_scores=rerank_scores,
-        doc_ids=doc_ids,
+        chunk_ids=[item["chunk_id"] for item in sources],
+        rerank_scores=[item["rerank_score"] for item in sources],
+        doc_ids=list({item["doc_id"] for item in sources}),
         cost_ms=cost_ms,
         meta={
-            "top_k_recall": top_k_recall,
-            "top_k_rerank": top_k_rerank
-        }
+            "top_k_recall": DEFAULT_RECALL_TOP_K,
+            "top_k_rerank": DEFAULT_RERANK_TOP_K,
+            # 与线上日志保持一致的分数/阈值字段，方便用 eval 结果定标（#6）
+            "cosine_scores": [item.get("score") for item in sources],
+            "thresholds": {
+                "cosine_min_score": settings.retrieval.cosine_min_score,
+                "rerank_min_score": settings.retrieval.rerank_min_score,
+            },
+        },
     )
 
     return {
         "answer": answer,
-        "sources": chunks
+        "sources": sources,
     }
+
 
 # 测试
 if __name__ == "__main__":

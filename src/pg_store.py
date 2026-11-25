@@ -21,27 +21,79 @@ class PGChunkStore:
             dbname=self.conn_info.dbname,
         )
 
+    @staticmethod
+    def _is_healthy(conn) -> bool:
+        """连接是否可用：closed == 0 表示正常；1 = 已关闭，2 = 状态异常（被服务器断开等）"""
+        return getattr(conn, "closed", 1) == 0
+
+    def _borrow(self):
+        """借出一个健康连接。
+
+        PG / 容器重启后，池里可能残留已断的连接，拿出来就用就会报错：
+        先探一次状态，坏了就 putconn(close=True) 丢弃再借一次，
+        避免“报错一直持续到进程重启”。
+        重试只发生在“还没执行任何 SQL”的取连接阶段，不会重复写。
+        """
+        conn = self._pool.getconn()
+        if self._is_healthy(conn):
+            return conn
+        try:
+            self._pool.putconn(conn, close=True)
+        except Exception as e:
+            print(f"[pg_store] 丢弃坏连接失败：{e}")
+        conn = self._pool.getconn()
+        if not self._is_healthy(conn):
+            # 把第二个坏连接也归还（关闭），否则它会永久卡在“已借出”，池会越用越小
+            try:
+                self._pool.putconn(conn, close=True)
+            except Exception:
+                pass
+            raise psycopg2.OperationalError(
+                "数据库连接池里没有可用连接（数据库可能未启动或已关闭）"
+            )
+        return conn
+
     @contextmanager
     def get_conn(self):
-        """从连接池借出连接，用完归还；异常时回滚并归还"""
-        conn = self._pool.getconn()
+        """从连接池借出连接，用完归还。
+
+        - 正常退出也 commit：读查询同样会开事务，不结束就会把连接以
+          `idle in transaction` 状态归还池（阻碍 vacuum、可能长期持锁）。
+          psycopg2 在无事务时 commit 是 no-op，所以重复 commit 没有副作用。
+        - 异常时回滚；如果错因是连接本身挂了，就把这条连接从池里丢弃，
+          下一条请求能拿到新连接（不自动重放 SQL，避免重复写）。
+        """
+        conn = self._borrow()
+        broken = False
         try:
             yield conn
+            conn.commit()
         except Exception:
-            conn.rollback()
+            try:
+                conn.rollback()
+            except Exception:
+                pass  # 连接已挂时 rollback 也会报错，不能掩盖原始异常
+            broken = getattr(conn, "closed", 1) != 0
             raise
         finally:
-            self._pool.putconn(conn)
+            self._pool.putconn(conn, close=broken)
 
     @contextmanager
     def transaction(self):
-        """事务上下文：正常结束提交，异常回滚。用于需要原子性的多步写入"""
-        conn = self._pool.getconn()
+        """事务上下文：正常结束提交，异常回滚。用于需要原子性的多步写入
+
+        同样先探连接健康度；连接挂了的异常会把该连接从池里丢弃。
+        """
+        conn = self._borrow()
+        broken = False
         try:
             with conn:  # with conn 会在正常退出时 commit，异常时 rollback
                 yield conn
+        except Exception:
+            broken = getattr(conn, "closed", 1) != 0
+            raise
         finally:
-            self._pool.putconn(conn)
+            self._pool.putconn(conn, close=broken)
 
     # ========== 新增通用方法（给 doc_manager 使用） ==========
     def execute(self, sql: str, params: tuple = ()):

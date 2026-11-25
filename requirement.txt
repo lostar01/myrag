@@ -1,15 +1,46 @@
-docling
-qdrant-client
-sentence_transformers
-tiktoken
-psycopg2-binary
-qdrant_client
-fastapi
-uvicorn[standard]
-python-multipart
-celery
-redis
-openai
-pydantic-settings
-pyyaml
-requests
+# 依赖清单（P0-余：去重 + 加版本边界）
+#
+# 用哪个文件：
+#   - 复现现有环境 / 部署：用 requirements.lock.txt（逐版本锁定，由
+#     scripts/pin_requirements.ps1 从现有环境生成）
+#   - 新环境从零装：装本文件（拿到"边界内最新"，不保证与现有环境逐版本一致）
+#
+# Python：3.10+（docling 2.70 起已放弃 3.9；本机 .pyc 是 cpython-310）
+
+# ---- 文档解析 ----
+# 页码链路（P0 #4）依赖 docling-core 的 export_to_markdown(page_break_placeholder=...)
+# 与 iterate_items 的页边界规则；大版本一升级就可能改导出行为 ⇒ 卡在 2.x。
+# 代码里已有兜底：docling 太旧不支持这些参数时只关页码、不影响解析。
+docling>=2.0,<3.0
+
+# ---- 向量库 ----
+# retrieve() 用 query_points(..., score_threshold=)（P0 #6），该参数 1.18 起才有。
+qdrant-client>=1.18,<2.0
+
+# ---- 配置加载 ----
+# settings.py 用的是 pydantic-settings v2 的 BaseSettings（v1 的 import 路径不同）。
+pydantic-settings>=2.0,<3.0
+
+# ---- 关系库 ----
+# pg_store 用 ThreadedConnectionPool + putconn(close=True)（P0 #3 死连接兜底）。
+psycopg2-binary>=2.9,<3.0
+
+# ---- Web / 任务 ----
+fastapi>=0.100,<1.0
+uvicorn[standard]>=0.23,<1.0
+python-multipart>=0.0.6
+celery>=5.3,<6.0
+redis>=5.0,<6.0
+
+# ---- 模型调用 ----
+openai>=1.0,<2.0
+requests>=2.31,<3.0
+tiktoken>=0.5,<1.0
+# 只被 embedding_service.py / rerank_service.py（本地兜底版，当前无引用）用到，
+# 主链路走 embedding_client / rerank_client 的 HTTP 接口（TEI）。
+sentence-transformers>=2.2,<6.0
+
+# ---- 其它 ----
+pyyaml>=6.0,<7.0
+
+# 注：原文件里重复写过 qdrant-client / qdrant_client（同一个包的两种写法），已合并。

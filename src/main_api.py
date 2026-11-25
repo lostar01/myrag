@@ -16,8 +16,10 @@ from celery_task_store import task_store
 from pg_store import pg_store
 from doc_manager import doc_manager
 from rag_chat_qa import chat_qa_stream
-from user_store import user_store, create_token, decode_token
+from user_store import user_store, create_token, decode_token, token_is_revoked
 from chat_store import chat_store
+from upload_paths import UPLOAD_DIR, ensure_upload_dir, resolve_upload_path
+from settings import settings
 
 app = FastAPI(title="RAG异步文档上传接口")
 
@@ -33,15 +35,22 @@ app.add_middleware(
     expose_headers=["*"],
 )
 
-UPLOAD_DIR = Path("./upload_cache")
-UPLOAD_DIR.mkdir(exist_ok=True)
+# 上传相关参数统一来自 config/config.yaml 的 upload 段（D1）
+# UPLOAD_DIR 已在 upload_paths 里解析成绝对路径，与进程 CWD 无关
+ensure_upload_dir()
 
 # 允许上传的文档后缀（docling 可解析的格式）
-ALLOWED_SUFFIXES = {".pdf", ".docx", ".pptx", ".xlsx", ".md", ".html", ".htm", ".txt"}
-# 单文件大小上限：50MB
-MAX_UPLOAD_SIZE = 50 * 1024 * 1024
+ALLOWED_SUFFIXES = settings.upload.suffix_set()
+# 单文件大小上限
+MAX_UPLOAD_SIZE = settings.upload.max_size_mb * 1024 * 1024
 # 分块写入大小：1MB
 CHUNK_SIZE = 1024 * 1024
+
+print(
+    f"[upload] 上传目录（绝对路径）：{UPLOAD_DIR}｜"
+    f"大小上限：{settings.upload.max_size_mb}MB｜"
+    f"允许类型：{', '.join(sorted(ALLOWED_SUFFIXES))}"
+)
 
 
 # ============ 用户管理相关 Pydantic 模型 ============
@@ -137,14 +146,40 @@ class UpdateSessionRequest(BaseModel):
 
 # ============ 鉴权依赖 ============
 def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
-    """从 Authorization: Bearer <token> 解析当前用户"""
+    """从 Authorization: Bearer <token> 解析当前用户，并做**可撤销**校验（P0 #7）。
+
+    token 自身只能证明“签名有效且未到 exp”；账号状态、角色、token_epoch
+    全部以库里那一行为准，所以：
+      - 管理员禁用 / 删除账号、重置密码、改角色后，旧 token 立刻失效；
+      - 代价是每次请求多一次 rag_user 的 PK 单行 SELECT（~1ms）。
+        不加进程内缓存（D6）：跨进程（uvicorn 多 worker + celery）无需考虑缓存一致性，
+        撤销也是立即生效。
+    """
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="缺少或非法的认证头")
     token = authorization[len("Bearer "):].strip()
     payload = decode_token(token)
     if not payload:
         raise HTTPException(status_code=401, detail="token 无效或已过期")
-    return payload
+
+    account = user_store.get_auth_context(payload.get("user_id"))
+    if not account:
+        raise HTTPException(status_code=401, detail="用户不存在或已被删除")
+    if account.get("status") != "active":
+        raise HTTPException(status_code=401, detail="账号已被禁用")
+    if token_is_revoked(payload, account.get("token_epoch")):
+        raise HTTPException(
+            status_code=401,
+            detail="token 已失效（密码或权限已变更），请重新登录",
+        )
+
+    # 角色以库为准：管理员被降权后，手里的旧 token 也立刻失去管理员权限
+    return {
+        "user_id": account["user_id"],
+        "username": account["username"],
+        "nickname": account.get("nickname"),
+        "role": account.get("role") or "user",
+    }
 
 
 def require_admin(user: dict = Depends(get_current_user)) -> dict:
@@ -295,6 +330,12 @@ async def update_user(
         fields.append("status = %s")
         params.append(req.status)
 
+    # 角色或状态变了 ⇒ 该账号已有的 token 全部作废（P0 #7）。
+    # 只改昵称不 bump，避免管理员编资料把用户踢下线。
+    if req.role is not None or req.status is not None:
+        fields.append("token_epoch = %s")
+        params.append(int(time.time()))
+
     if not fields:
         raise HTTPException(status_code=400, detail="没有需要更新的字段")
 
@@ -433,14 +474,16 @@ def _heal_stale_if_due():
 
 
 def _safe_unlink_upload(file_path: Optional[str]):
-    """只允许删除 upload_cache 目录下的源文件，避免路径穿越误删。"""
-    if not file_path:
+    """只允许删除上传目录下的源文件，避免路径穿越误删。
+
+    路径解析统一走 upload_paths.resolve_upload_path：新数据是绝对路径，
+    老数据里的相对路径也能按同一规则定位到当前上传目录。
+    """
+    target = resolve_upload_path(file_path)
+    if target is None:
         return
     try:
-        target = Path(file_path).resolve()
-        base = UPLOAD_DIR.resolve()
-        if target != base and base in target.parents:
-            target.unlink(missing_ok=True)
+        target.unlink(missing_ok=True)
     except Exception as e:
         print(f"[upload] 删除源文件失败 path={file_path}: {e}")
 
@@ -641,9 +684,27 @@ async def list_documents(
     offset: int = 0,
     user: dict = Depends(get_current_user),
 ):
-    """文档列表查询"""
-    docs = doc_manager.list_documents(limit=limit, offset=offset)
-    return {"total": len(docs), "documents": docs}
+    """文档列表（旧接口，保留兼容）：已按登录身份过滤（P0 #5）。
+
+    普通用户只能看到自己上传的文档，管理员看全部。
+    直接复用「上传记录」已有的按用户过滤 SQL（doc_manager.list_upload_records），
+    不再单独写一份没有权限过滤的 SQL。
+    字段名保持旧接口的 doc_name（值就是权威文件名 rag_doc.doc_name）。
+    """
+    uid = None if user.get("role") == "admin" else user["user_id"]
+    rows, total = doc_manager.list_upload_records(user_id=uid, limit=limit, offset=offset)
+    documents = [
+        {
+            "doc_id": r["doc_id"],
+            "doc_name": r.get("file_name"),
+            "page_count": r.get("page_count"),
+            "status": r.get("status"),
+            "created_at": r.get("created_at"),
+            "updated_at": r.get("updated_at"),
+        }
+        for r in rows
+    ]
+    return {"total": total, "documents": documents}
 
 @app.delete("/documents/{doc_id}")
 async def delete_document(doc_id: str, _admin: dict = Depends(require_admin)):

@@ -1,0 +1,142 @@
+# ============================================================================
+# 配置模板 —— 复制成 config/config.yaml 后填写真实值（config.yaml 不入库）
+#
+#   PowerShell: Copy-Item config/config.yaml.example config/config.yaml
+#   bash:       cp config/config.yaml.example config/config.yaml
+#
+# 需要替换的占位值（全部标了 CHANGE_ME）：auth.secret_key（token 签名密钥）、
+# pg.password、qdrant.api_key、llm.api_key，以及所有服务地址 / 模型目录（按你自己的机器改）。
+# 说明：`config/config.yaml` 已被 .gitignore 排除、只存本地 ⇒ 凭据都集中在这一个文件，
+# 请收好文件权限（chmod 600 / icacls），备份单独加密。
+# auth.secret_key 也可以用环境变量 RAG_SECRET_KEY 覆盖（环境变量优先，
+# 方便以后用 docker -e / systemd EnvironmentFile）。
+# ============================================================================
+
+# 应用总开关：调试模式，true会打印更多日志（生产建议 false）
+debug: false
+# 日志级别：DEBUG / INFO / WARNING / ERROR
+log_level: "INFO"
+
+# 文档提取模块（docling解析PDF等文档）
+docling_parser:
+  # docling模型缓存目录，存放layout、ocr等模型工件
+  # 下载命令：docling-tools models download -o "D:/docling_models"
+  docling_artifacts_dir: "D:/docling_models"
+  # 解析输出根目录：md、json、提取图片都会放在这里
+  output_dir: "D:/rag_output"
+  # 是否记录页码（P0 #4）。默认 false：关掉后连页边界占位符都不用，
+  # 切块行为与修复前逐字一致，chunk 的 page_no 保持 NULL。
+  # 置 true：每个 chunk 写 page_no（所在页）；section 跳页时 extra_meta.page_span 写页范围。
+  # 只对带页码的源（PDF/PPTX）有效，.md/.txt/.html 依旧为空。
+  enable_page_no: false
+
+# markdown预处理模块
+markdown_preprocessor:
+  # 每个chunk的token数，超过这个数会拆分
+  chunk_size: 700
+  # 相邻chunk重叠的token数
+  overlap: 120
+  # 最小chunk的token数，小于这个数会被并掉
+  min_chunk_token: 10
+  # 使用的embedding模型目录（只有本地兜底模块 embedding_service 会读）
+  embedding_model_name: "D:/models/bge-m3"
+  # 是否只用本地文件（true 则不会去 HuggingFace 下载）
+  local_files_only: True
+  # 是否打印切块过程日志
+  enable_log: False
+  # 是否跳过只有标题的section
+  skip_title_only_section: False
+
+# embedding模块（走 TEI 的 HTTP 服务，不是进程内加载）
+embedding:
+  model_name: "D:/models/bge-m3"
+  local_files_only: True
+  # cuda / cpu（同样只影响本地兜底模块）
+  device: "cuda"
+  embed_url: "http://127.0.0.1:8080/embed"
+  embed_health_url: "http://127.0.0.1:8080/health"
+
+# rerank模块（同样走 TEI 服务）
+rerank:
+  model_name: "D:/models/bge-reranker-v2-m3"
+  local_files_only: True
+  rerank_url: "http://127.0.0.1:8081/rerank"
+  rerank_health_url: "http://127.0.0.1:8081/health"
+
+# llm 模块
+llm:
+  # OpenAI 兼容服务的 base_url（Ollama / vLLM / 各家 API 都行）
+  base_url: "http://127.0.0.1:11434/v1"
+  # 密钥：CHANGE_ME。Ollama 这类本地服务不校验，填 "ollama" 即可
+  api_key: "CHANGE_ME__llm_api_key"
+  model_name: "qwen2.5:latest"
+
+# chat模块
+chat:
+  # 历史 + 问题 + 模板 + 参考资料 的总 token 预算（注意：按 tiktoken 估算，不是模型真实口径）
+  max_total_tokens: 4096
+
+# 鉴权模块（token 签名参数）
+auth:
+  # CHANGE_ME：token 签名密钥。生成一个：
+  #   python -c "import secrets; print(secrets.token_hex(32))"   # 64 个十六进制字符
+  # 要求：至少 32 字符，且不能等于内置默认密钥，否则启动直接报错（不会静默跑）。
+  # 重要：这个值要长期固定，不要每次启动换一个（换一个 = 全员立即重新登录）；
+  #       多个进程（uvicorn 多 worker + celery）必须读到同一个值，否则会随机 401。
+  # 不想写在文件里：删掉下面这行，改用环境变量 RAG_SECRET_KEY（环境变量优先）。
+  secret_key: "CHANGE_ME__rag_secret_key"
+  # token 有效期（秒），默认 7 天；环境变量 RAG_TOKEN_TTL 优先
+  token_ttl: 604800
+
+# 检索模块（召回 + 重排）；整段可省略，省略时用代码里的默认值
+retrieval:
+  # 向量粗召回数量
+  recall_top_k: 6
+  # 重排后送给 LLM 的数量
+  rerank_top_k: 3
+  # 稠密召回（bge-m3，归一化余弦）相似度下限；0 = 不启用过滤。
+  # bge-m3 的余弦分布很压缩：不相关的中文长块常见 0.30~0.40，相关长块 0.45~0.65。
+  # 别把社区常见的 0.70（Weaviate 默认值，按 OpenAI 系模型标定）拄过来，会把召回卡死。
+  cosine_min_score: 0.35
+  # 重排（bge-reranker-v2-m3，sigmoid 分数）下限；0 = 不启用过滤。
+  # 官方模型卡实例分数：相关对 0.9948，不相关对 0.000278 / 0.0035 ⇒ 0.10 够剔明显不相关。
+  # 事后看 rag_qa_log.meta.cosine_scores / meta.thresholds 再定标。
+  rerank_min_score: 0.10
+
+# qdrant模块
+qdrant:
+  host: "127.0.0.1"
+  port: 6333
+  collection_name: "rag"
+  # CHANGE_ME：Qdrant 的 API key（QDRANT__SERVICE__API_KEY 那个）。没开鉴权就留空/删掉这行
+  api_key: "CHANGE_ME__qdrant_api_key"
+  collection_shard_number: 1
+  collection_replication_factor: 1
+  collection_write_consistency_factor: 1
+
+# postgres模块
+pg:
+  host: "127.0.0.1"
+  port: 5432
+  user: "raguser"
+  # CHANGE_ME：换成你自己的强密码（不要沿用 Readme 里的示例值）
+  password: "CHANGE_ME__pg_password"
+  dbname: "rag_db"
+
+# celery模块
+celery:
+  broker_url: "redis://127.0.0.1:6379/0"
+  backend_url: "redis://127.0.0.1:6379/0"
+
+# 上传模块（上传相关参数统一在这里配，不用环境变量）
+upload:
+  # 上传文件缓存目录：
+  #   相对路径 → 按「仓库根」（config/ 的上一级）解析，与进程 CWD 无关
+  #   绝对路径 → 原样使用（生产挂数据卷时更直观，例如 "D:/rag_data/upload_cache"）
+  # 历史遗留注意：老版本按进程 CWD 写死过 ./upload_cache，导致仓库根和 src/ 下都出现过
+  # 上传目录。当前代码默认按仓库根解析 ⇒ 建议明确写成 src/upload_cache 这类唯一位置。
+  dir: "src/upload_cache"
+  # 单文件大小上限（MB）
+  max_size_mb: 50
+  # 允许上传的后缀（docling 可解析的格式）；旧版 .doc 始终会被单独拒掉
+  allowed_suffixes: [".pdf", ".docx", ".pptx", ".xlsx", ".md", ".html", ".htm", ".txt"]
