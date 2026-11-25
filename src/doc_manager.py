@@ -6,10 +6,12 @@ from typing import List, Optional, Tuple
 from psycopg2.extras import Json
 from pg_store import pg_store
 from qdrant_store import qdrant_store
-from docling_parser import doc_parser
+from docling_parser import doc_parser, export_markdown_with_pages
 from markdown_preprocessor import process_markdown_to_chunks, ChunkItem
 # from embedding_service import embedding_service
 from embedding_client import embedding_client
+from upload_paths import resolve_upload_path
+from settings import settings
 
 
 # 超过该时长仍处于 pending / running 的记录视为“卡死”（worker 被强杀、容器重启等）：
@@ -175,8 +177,9 @@ class DocManager:
         - 无任务行、停在 processing 超时的文档同样兼底。
         返回被自愈的任务行数。
 
-        注意：必须用 pg_store.execute（会 commit）；pg_store.query_* 不提交事务，
-        拿它跑 UPDATE 会得到未提交的假结果并留下悬挂事务。
+        注意：写操作统一走 pg_store.execute（显式提交）；pg_store.query_* 是读接口，
+        虽然连接层现在会在归还前结束事务（不再留 idle in transaction），
+        但不要拿 query_* 去跑 UPDATE —— 写语义应当只看 execute。
         """
         targets = self.pg.query_all(
             "SELECT task_id, doc_id FROM rag_task "
@@ -249,6 +252,18 @@ class DocManager:
 
         return: {doc_id, status, chunks, msg}
         """
+        # 路径兜底解析（P0 #2）：新上传落库的是绝对路径；库里老数据可还是
+        # ./upload_cache/xxx 这种相对路径，这里按同一规则解析成绝对路径，
+        # 后面的 md5 / getsize / doc_parser 全部用解析后的路径，
+        # 与 worker 的 CWD 无关。
+        resolved = resolve_upload_path(file_path)
+        if resolved is None or not resolved.exists():
+            raise FileNotFoundError(
+                f"待解析文件不存在：{file_path}（解析后：{resolved}，"
+                "可能是上传目录配置变了或源文件已被清理）"
+            )
+        file_path = str(resolved)
+
         file_md5 = calc_file_md5(file_path)
         doc_name = file_name
         try:
@@ -277,8 +292,16 @@ class DocManager:
 
         try:
             doc, json_out, tables = doc_parser(file_path, page_range=page_range)
-            md_text = doc.export_to_markdown()
             page_count = len(doc.pages)
+
+            # 页码链路（P0 #4）：默认关闭（docling_parser.enable_page_no: false）。
+            # 关掉时走原来的 doc.export_to_markdown()，行为与修复前逐字一致；
+            # 开启时带页边界占位符，产出与行号对齐的 page_of_line。
+            if settings.docling_parser.enable_page_no:
+                md_text, page_of_line = export_markdown_with_pages(doc)
+            else:
+                md_text = doc.export_to_markdown()
+                page_of_line = []
 
             # ✅ 补齐全部入参
             chunks: List[ChunkItem] = process_markdown_to_chunks(
@@ -287,7 +310,11 @@ class DocManager:
                 doc_id=doc_id,
                 doc_name=doc_name,
                 doc_type="pdf",
-                source_path=str(file_path)
+                source_path=str(file_path),
+                # D7-a：首标题前的正文挂到以文档名命名的隐式 section 上
+                preamble_title=doc_name,
+                # #4：页号（enable_page_no=false 时为空列表 ⇒ 不写页码）
+                page_of_line=page_of_line,
             )
 
             # 先算 embedding（外部调用，放在事务外，避免长事务占用连接）
@@ -390,7 +417,12 @@ class DocManager:
         return self.add_document(file_path, file_name, page_range)
 
     def list_documents(self, limit: int = 100, offset: int = 0):
-        """文档列表查询"""
+        """全库文档列表（原始 rag_doc行）。
+
+        ⚠︎ 这个查询**没有归属人过滤**，不要直接接副HTTP接口：
+        对外接口一律用 list_upload_records(user_id=...)（P0 #5 修的正是这个）。
+        目前只给脚本 / 运维排查用。
+        """
         sql = "SELECT * FROM rag_doc ORDER BY updated_at DESC LIMIT %s OFFSET %s;"
         return self.pg.query_all(sql, (limit, offset))
 

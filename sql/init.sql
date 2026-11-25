@@ -40,6 +40,11 @@ CREATE TABLE IF NOT EXISTS rag_user (
     nickname      TEXT,
     role          VARCHAR(16) DEFAULT 'user',    -- user / admin
     status        VARCHAR(16) DEFAULT 'active',  -- active / disabled
+    -- token 撤销水位（epoch 秒）：token payload 里的 iat < 该值即失效。
+    -- 故意用 BIGINT epoch 而不是 TIMESTAMP：本库里 created_at 是
+    -- TIMESTAMP WITHOUT TIME ZONE + NOW()（服务器本地时区），
+    -- 与 Python time.time() 的 UTC epoch 直接比会差一个时区偏移。
+    token_epoch   BIGINT NOT NULL DEFAULT 0,
     created_at    TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
     updated_at    TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
     meta          JSONB DEFAULT '{}'::jsonb
@@ -237,7 +242,23 @@ BEGIN
     END IF;
 
     ------------------------------------------------------------------------
-    -- 6.5 md5 唯一索引（老库可能有同 md5 重复记录，失败只告警不中断）
+    -- 6.5 rag_user.token_epoch（token 可撤销，P0 #7）
+    --     新库已在 CREATE TABLE 里内联；老库在这里补列。
+    --     默认 0 ⇒ 升级当天已有的 token 仍然有效（不踢人），
+    --     直到管理员改密 / 改角色 / 禁用才会被 bump。
+    ------------------------------------------------------------------------
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'rag_user' AND column_name = 'token_epoch') THEN
+        BEGIN
+            ALTER TABLE rag_user ADD COLUMN token_epoch BIGINT NOT NULL DEFAULT 0;
+            RAISE NOTICE '已为 rag_user 补 token_epoch 列';
+        EXCEPTION WHEN others THEN
+            RAISE NOTICE '跳过 rag_user.token_epoch（已存在或其它原因）：%', SQLERRM;
+        END;
+    END IF;
+
+    ------------------------------------------------------------------------
+    -- 6.6 md5 唯一索引（老库可能有同 md5 重复记录，失败只告警不中断）
     ------------------------------------------------------------------------
     IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'uq_rag_doc_file_md5') THEN
         BEGIN
@@ -255,6 +276,8 @@ END $$;
 -- ============================================================================
 -- 6. 注释（放在最后：老库升级段补完列之后再执行）
 -- ============================================================================
+
+COMMENT ON COLUMN rag_user.token_epoch     IS 'token 撤销水位（epoch 秒）：token 的 iat 小于该值即失效；改密/改角色/禁用时更新';
 
 COMMENT ON TABLE  rag_chunk                IS 'RAG文档分块结构化存储';
 COMMENT ON COLUMN rag_chunk.chunk_id       IS 'chunk唯一uuid，和qdrant point id一致';
