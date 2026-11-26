@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Header
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Header, Query
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -18,6 +18,7 @@ from doc_manager import doc_manager
 from rag_chat_qa import chat_qa_stream
 from user_store import user_store, create_token, decode_token, token_is_revoked
 from chat_store import chat_store
+import memory_service
 from upload_paths import UPLOAD_DIR, ensure_upload_dir, resolve_upload_path
 from settings import settings
 
@@ -85,6 +86,18 @@ class ChangePasswordRequest(BaseModel):
 
 class ResetPasswordRequest(BaseModel):
     new_password: str = Field(..., min_length=6, max_length=128)
+
+
+class CreateMemoryRequest(BaseModel):
+    # profile = 用户是谁/什么领域；preference = 回答风格与范围偏好
+    kind: str = Field("preference", pattern="^(profile|preference)$")
+    content: str = Field(..., min_length=2, max_length=200)
+
+
+class UpdateMemoryRequest(BaseModel):
+    content: Optional[str] = Field(None, min_length=2, max_length=200)
+    # archived = 用户手动“删除”（软删，不注入也不再被语义召回）
+    status: Optional[str] = Field(None, pattern="^(active|archived)$")
 
 
 # 是否开放自助注册（默认关闭，生产环境建议由管理员创建账号）
@@ -353,8 +366,12 @@ async def delete_user(user_id: str, _admin: dict = Depends(require_admin)):
         raise HTTPException(status_code=400, detail="不能删除自己的账号")
     if not user_store.get_by_id(user_id):
         raise HTTPException(status_code=404, detail="用户不存在")
+    # 先清记忆：隐私上“人删了、画像与偏好还留在库里”说不通
+    purged = memory_service.purge_user(user_id)
     user_store.delete_user(user_id)
-    return {"user_id": user_id, "msg": "用户已删除"}
+    # 已知缺口（本次不改）：该用户的 chat_session / chat_message 仍会留在库里（历史行为）。
+    # 要一并删就需要在用户删除时级联删会话，已记在 Readme 的待办里。
+    return {"user_id": user_id, "msg": f"用户已删除（同时清除记忆 {purged} 条）"}
 
 
 # ============ 会话管理 API ============
@@ -436,6 +453,75 @@ async def delete_session(chat_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="无权删除该会话")
     chat_store.delete_session(chat_id)
     return {"chat_id": chat_id, "msg": "会话已删除"}
+
+
+# ============ 记忆 API（用户本人可见；管理员也没有旁路）============
+# 注意：这里的接口不受 memory.enable 限制 —— 关掉功能后，用户仍然要能看到并清掉旧记忆。
+# 开关只影响两件事：回答时是否注入记忆、回答后是否自动抽取。
+
+@app.get("/memories")
+async def list_memories(
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    kind: Optional[str] = Query(None, description="profile | preference"),
+    user: dict = Depends(get_current_user),
+):
+    """列出我自己的记忆（按权重/最近使用排序）。"""
+    items, total = memory_service.list_for_user(user["user_id"], limit=limit, offset=offset, kind=kind)
+    return {
+        "total": total,
+        "items": items,
+        # 已归档（自动去重/封顶/过期，或用户自己删掉的）条数。
+        # 不列明细（用户主动删的东西不该再摆回他面前），但要说清“不是 0 条、是都归档了”。
+        "archived_total": memory_service.count_archived(user["user_id"]),
+        # 前端用这个值提示“当前只展示历史记忆，功能已关闭”
+        "memory_enabled": settings.memory.enable,
+    }
+
+
+@app.post("/memories")
+async def create_memory(req: CreateMemoryRequest, user: dict = Depends(get_current_user)):
+    """手动加一条记忆（与自动抽取走同一套去重，重复内容不会堆条目）。"""
+    row = memory_service.create_manual(user["user_id"], req.kind, req.content)
+    if not row:
+        raise HTTPException(status_code=400, detail="记忆内容为空或过长")
+    return {"msg": "已保存", "memory": row}
+
+
+@app.put("/memories/{memory_id}")
+async def update_memory(
+    memory_id: str,
+    req: UpdateMemoryRequest,
+    user: dict = Depends(get_current_user),
+):
+    """改内容或改状态。
+
+    改内容会归档旧条目 + 新建一条（保留审计轨迹，也不会出现 hash 与内容不一致）；
+    所以返回的 memory 可能带着新 id，前端改完后重新拉列表即可。
+    """
+    if req.content is None and req.status is None:
+        raise HTTPException(status_code=400, detail="没有需要更新的字段")
+    row = memory_service.update_memory(
+        user["user_id"], memory_id, content=req.content, status=req.status
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="记忆不存在或不属于当前用户")
+    return {"msg": "更新成功", "memory": row}
+
+
+@app.delete("/memories/{memory_id}")
+async def delete_memory(memory_id: str, user: dict = Depends(get_current_user)):
+    """删除一条记忆（软删 + 删向量点）。"""
+    if not memory_service.delete_memory(user["user_id"], memory_id):
+        raise HTTPException(status_code=404, detail="记忆不存在或不属于当前用户")
+    return {"memory_id": memory_id, "msg": "已删除"}
+
+
+@app.delete("/memories")
+async def clear_memories(user: dict = Depends(get_current_user)):
+    """清空我的全部记忆（隐私出口，必须一钮可用）。"""
+    deleted = memory_service.clear_all(user["user_id"])
+    return {"deleted": deleted, "msg": f"已清空 {deleted} 条记忆"}
 
 
 # ============ 文档 / 任务 / 问答 API ============
@@ -742,7 +828,8 @@ async def chat_stream(chat_id: str, query: str, user: dict = Depends(get_current
 
         def worker():
             try:
-                for event in chat_qa_stream(chat_id=chat_id, query=query):
+                # user_id 从 token 传进去：记忆必须用可信身份（会话已校验归属，两处一致）
+                for event in chat_qa_stream(chat_id=chat_id, query=query, user_id=user["user_id"]):
                     q.put(event)
             except Exception as e:  # 生成器内部异常转成 error 事件
                 q.put({"type": "error", "message": str(e)})

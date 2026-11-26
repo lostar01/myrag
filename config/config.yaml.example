@@ -74,7 +74,10 @@ llm:
 # chat模块
 chat:
   # 历史 + 问题 + 模板 + 参考资料 的总 token 预算（注意：按 tiktoken 估算，不是模型真实口径）
-  max_total_tokens: 4096
+  # 开记忆（会话摘要 + 画像）后记忆段落也要吃预算，默认 4096 不够用 ⇒ 调到 8192。
+  # ⚠ ollama 跑 qwen2.5 时服务端 num_ctx 默认可能只有 4096，必须至少 8192，
+  #    否则模型自己截断，表现为“丢上下文/答非所问”，比不开记忆还难查。
+  max_total_tokens: 8192
 
 # 鉴权模块（token 签名参数）
 auth:
@@ -140,3 +143,30 @@ upload:
   max_size_mb: 50
   # 允许上传的后缀（docling 可解析的格式）；旧版 .doc 始终会被单独拒掉
   allowed_suffixes: [".pdf", ".docx", ".pptx", ".xlsx", ".md", ".html", ".htm", ".txt"]
+
+# 记忆模块（长短记忆）—— 默认全关，按四层逆风灰度：
+#   enable=true → enable_summary → enable_profile → enable_vector（出问题只退一层）
+# enable=false 时 prompt 里不会出现任何记忆段落，行为与加记忆之前逐字一致。
+# 记忆任何环节失败都只打日志，不影响问答主链路。
+# 注：用环境变量覆盖要加前缀 RAG_MEMORY_（如 RAG_MEMORY_ENABLE=true），
+#     避免 enable 这种短字段名被其它环境变量误顶。
+memory:
+  enable: false                      # 总开关
+  qdrant_collection_name: "rag_memory"   # 记忆向量集（与文档块集分开）
+
+  # 短期：会话内滚动摘要（存在 chat_session.meta，不建表）
+  enable_summary: true
+  keep_recent_turns: 6               # 最近 N 轮永远当原文，不进摘要
+  summary_trigger_ratio: 0.6         # 历史估算 token 超过 ratio×max_total_tokens 才压缩
+  summary_max_tokens: 400            # 摘要本身的 token 上限
+
+  # 长期：用户画像/偏好（PG 为真相，Qdrant 做语义召回）
+  enable_profile: true               # 画像条目 + 异步抽取（Celery）
+  enable_vector: true                # 语义召回
+  profile_limit: 12                  # 固定注入的核心画像条数
+  profile_max_chars: 60              # 单条字数上限
+  recall_top_k: 4                    # 语义召回条数
+  recall_min_score: 0.45             # 记忆条目是短文本，分数分布跟文档块不同，单独调
+  max_items_per_user: 200            # 超出后按 (weight, last_used_at) 归档最旧的
+  default_ttl_days: 180              # expires_at 默认值，防长期污染
+  max_new_items: 5                   # 单次抽取最多写入几条

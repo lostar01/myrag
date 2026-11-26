@@ -535,6 +535,126 @@
     ]);
   }
 
+  // ---------------- 我的记忆 ----------------
+  // 记忆是完全私有且可完全关掉的：看到什么、删什么、一键清空，全部在这个弹窗里。
+  const MEMORY_KIND_LABEL = { profile: "画像", preference: "偏好" };
+
+  function memoryRow(m) {
+    const meta = [];
+    meta.push(`权重 ${Number(m.weight || 0).toFixed(2)}`);
+    meta.push(`命中 ${m.hits || 0} 次`);
+    meta.push(m.source_chat_id ? "自动学习" : "手动添加");
+    if (m.expires_at) meta.push(`有效期至 ${formatTime(m.expires_at)}`);
+    return `
+      <div class="memory-item">
+        <div class="memory-content">${escapeHtml(m.content)}</div>
+        <div class="memory-meta">
+          <span class="memory-kind">${MEMORY_KIND_LABEL[m.kind] || "偏好"}</span>
+          <span>${escapeHtml(meta.join(" · "))}</span>
+          <button class="btn-small btn-danger memory-del" data-del="${escapeHtml(m.memory_id)}">删除</button>
+        </div>
+      </div>`;
+  }
+
+  async function openMemoriesModal() {
+    let data;
+    try {
+      data = await api("/memories?limit=200");
+    } catch (err) {
+      alert("读取记忆失败：" + err.message);
+      return;
+    }
+
+    const items = data.items || [];
+    const archived = data.archived_total || 0;
+    let hint = data.memory_enabled
+      ? "系统会在每次回答后自动学习你稳定的背景与偏好（回答风格、关注领域等），提问时带进上下文。觉得不对就直接删。"
+      : "记忆功能当前未开启（config.yaml 的 memory.enable = false），下面只是历史遗留条目，可以逐条删除或全部清空。";
+    // 这条很重要：条目被自动去重/过期归档时，列表会突然变 0 条，不解释就是“我的记忆丢了”
+    if (archived > 0 && items.length === 0) {
+      hint += `（另有 ${archived} 条旧记录已被归档：自动去重、条目封顶或过期，也可能你之前删过；它们不会再被使用，也不在下面列出。）`;
+    }
+
+    const body = `
+      <div class="memory-hint">${hint}</div>
+      <div class="memory-list">
+        ${items.length ? items.map(memoryRow).join("") : '<div class="memory-empty">还没有记忆条目</div>'}
+      </div>
+      <div class="memory-form">
+        <div class="form-field memory-form-input">
+          <label for="m-memory-content">手动补一条（最多 200 字）</label>
+          <input id="m-memory-content" maxlength="200" placeholder="例：回答要简短，结论写在前面" />
+        </div>
+        <div class="form-field memory-form-kind">
+          <label for="m-memory-kind">类型</label>
+          <select id="m-memory-kind">
+            <option value="preference">偏好</option>
+            <option value="profile">画像</option>
+          </select>
+        </div>
+        <button class="btn-small btn-accent" id="m-memory-add" type="button">添加</button>
+      </div>
+      <div class="form-error" id="m-memory-error"></div>
+    `;
+
+    openModal("我的记忆", body, [
+      { text: "关闭", className: "btn-small", onClick: closeModal },
+      {
+        text: "清空全部记忆",
+        className: "btn-small btn-danger",
+        onClick: async () => {
+          if (!confirm("确定清空我的全部记忆？此操作不可撤销。")) return;
+          try {
+            const res = await api("/memories", { method: "DELETE" });
+            alert(res.msg || "已清空");
+            closeModal();
+          } catch (err) {
+            alert("清空失败：" + err.message);
+          }
+        },
+      },
+    ]);
+
+    // openModal 只给 footer 按钮绑事件，列表行内/表单里的事件要自己接
+    const addBtn = $("m-memory-add");
+    const input = $("m-memory-content");
+    const submitAdd = async () => {
+      const errEl = $("m-memory-error");
+      errEl.textContent = "";
+      const content = input.value.trim();
+      if (!content) return (errEl.textContent = "请输入记忆内容");
+      addBtn.disabled = true;
+      try {
+        await api("/memories", {
+          method: "POST",
+          body: JSON.stringify({ kind: $("m-memory-kind").value, content }),
+        });
+        await openMemoriesModal();  // 重拉一次列表（同时能看到自动去重的结果）
+      } catch (err) {
+        errEl.textContent = err.message;
+        addBtn.disabled = false;
+      }
+    };
+    addBtn.addEventListener("click", submitAdd);
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") submitAdd();
+    });
+
+    document.querySelectorAll("[data-del]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const errEl = $("m-memory-error");
+        errEl.textContent = "";
+        try {
+          await api(`/memories/${btn.getAttribute("data-del")}`, { method: "DELETE" });
+          const row = btn.closest(".memory-item");
+          if (row) row.remove();
+        } catch (err) {
+          errEl.textContent = err.message;
+        }
+      });
+    });
+  }
+
   // ---------------- 头像下拉菜单 ----------------
   function closeUserMenu() {
     const pop = $("user-menu-pop");
@@ -562,6 +682,10 @@
     $("change-pwd-btn").addEventListener("click", () => {
       closeUserMenu();
       openChangePasswordModal();
+    });
+    $("memories-btn").addEventListener("click", () => {
+      closeUserMenu();
+      openMemoriesModal();
     });
     $("back-chat-btn").addEventListener("click", showChatView);
 

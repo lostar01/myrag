@@ -396,8 +396,9 @@ Token 本身只装身份线索（`user_id` / `role` / `iat` / `exp`），**能�
 
 > 这个文件**不入库**，模板是 `config/config.yaml.example`（见上方「配置：真实配置不入库」）。
 
-配置里新加了三块，**都是可选的**：旧的 `config.yaml` 没有这些段也能正常启动（默认值写在代码
-`src/settings.py` 的 `UploadSettings` / `RetrievalSettings` / `DoclingParserSettings` 里）。
+配置里新加的这些段**都是可选的**：旧的 `config.yaml` 没有这些段也能正常启动（默认值写在代码
+`src/settings.py` 的 `UploadSettings` / `RetrievalSettings` / `DoclingParserSettings` / `MemorySettings` 里）。
+下面依次是 `upload:`、`retrieval:`、`docling_parser`、`memory:`（`auth:` 见上方「启动前必须配好 token 签名密钥」）。
 
 ### `upload:`：上传目录与限制
 
@@ -459,6 +460,87 @@ docling_parser:
 - prompt 里的参考资料行：有页码才写 `| 页码：3`，没有就整段省略（以前会写成字面量 `页码：None`）。
 - 滑动窗口切出的多个 chunk 共用所在 section 的页范围（精确到 chunk 级需要 block 级映射，本次未做）。
 
+### `memory:`：长短记忆（默认关闭）
+
+```yaml
+memory:
+  enable: false                      # 总开关（下面所有子开关都在它 = true 时才生效）
+  qdrant_collection_name: "rag_memory"
+
+  enable_summary: true               # 短期：会话滚动摘要（存 chat_session.meta，不建表）
+  keep_recent_turns: 6               # 最近 N 轮永远当原文，不进摘要
+  summary_trigger_ratio: 0.6         # 历史估算 token 超过 ratio×max_total_tokens 才压缩
+  summary_max_tokens: 400
+
+  enable_profile: true               # 长期：用户画像/偏好条目（PG）+ 异步抽取
+  enable_vector: true                # 长期：语义召回（Qdrant）
+  profile_limit: 12                  # 固定注入的核心画像条数
+  profile_max_chars: 60              # 单条字数上限
+  recall_top_k: 4
+  recall_min_score: 0.45             # 记忆是短文本，跟文档块分布不同，单独调
+  max_items_per_user: 200
+  default_ttl_days: 180              # expires_at 默认值，防长期污染
+  max_new_items: 5                   # 单次抽取最多写入几条
+```
+
+完整行为、隐私与上线顺序见下方「[长短记忆](#长短记忆会话摘要--用户画像)」。
+
+开关的两个坑（已实测确认）：
+- **YAML 里写了某个 key，就以 YAML 为准**：`RAG_MEMORY_*` 环境变量只在 YAML 里没有该 key 时才生效
+  （嵌套模型里 init 优先于 env）。想临时换一套开关又不改文件：
+  `RAG_CONFIG=config/xxx.local.yaml`（`config/*.local.yaml` 已被 gitignore）。
+- **改完 config 必须重启 API 和 celery worker**：配置只在进程启动时读一次。
+  启动时两边都会打印一行 `[memory] enable=…｜短期滚动摘要=…｜画像条目=…｜向量召回=…`，
+  总开关开着但子开关全关时会带 ⚠ 提醒（否则就是个静默空转）。
+
+配套改动：`chat.max_total_tokens` 从 `4096` 提到 **`8192`**（多了一段记忆要算进预算）。
+⚠ 用本地 ollama 时要把 `num_ctx` 提到 ≥ 8192，否则 prompt 会被静默截断。
+
+### 切块行为修正 2：正文结构不再被压平、大表按行切并重复表头
+
+两个**入库阶段**的结构性缺陷（只影响新上传/重传的文档，老 chunk 不会自动变）：
+
+**1) 长章节的正文被压平（影响 85% 的存量块）**
+
+`sliding_split` 以前是 `tokenizer.encode` → `decode` 重建文本，而 bge-m3 的分词器（XLM-R）
+带 `nmt_nfkc` 归一化：重建后**换行变空格、全角标点变半角**。后果是列表/段落边界消失、
+全角括号书名号被改写。实测当前库 3169 个 chunk 里 **2688 个（85%）完全没有换行**。
+
+现在改用 fast tokenizer 的 `return_offsets_mapping` 拿 token→**原始字符区间**，
+按 `text[char_start:char_end]` 切片：换行、全角标点、表格行一律原样保留。
+
+**2) 大表被 700-token 窗口一刀切（丢表头、切断行）**
+
+一张 300 行的表切成 8 块时，第 2 块起**没有表头**，块里只剩 `| 广东省 | 111091 |`，
+这块文本里没有任何列语义（"生产总值"这几个字不在里面），问"广东的生产总值"召不回来；
+窗口还会把一行切成两半。
+
+现在表格先按「整行」分组再切，**每块重复表头**：
+
+```yaml
+# 每块实际长这样（表头/口径 + 一行组）
+| 时间：2026年第3季度 | |
+|---|---|
+| 地区 | 生产总值（亿元） |
+| 北京市 | 40468 |
+| 天津市 | 14101 |
+```
+
+- 绝不切断行；单行超预算（极宽的表）才退化为该行独块；
+- `is_table` 改为结构化判定（不再靠 `"|" in text` 猜，旧写法把 41 个带表格字符的块里 24 个判错）；
+- 新增 `rag_chunk.extra_meta`：`row_span: [起行, 止行]`（1-based，含表头之后的数据行）、
+  `table_index`（同一 section 内第几张表），跳页时仍叠加 `page_span`；
+- 表格与正文混排时分段分别切（正文走滑窗、表格走行组），互不干扰。
+
+**3) 顺带修掉：解析阶段把段落/列表黏成一坨**
+
+`parse_ast_build_tree` 以前用 `"".join(tok.content)` 拼正文，而 markdown_it 把每个列表项、
+每个段落都拆成独立 token ⇒ 换行和 `- ` 标记全部丢失（列表变一句话，混排时表格首行被黏到
+上一句末尾，连带把表头吃掉）。现在在块结束 token 上补换行、在列表项前补标记，正文结构保留。
+
+> ⚠ 这三项都发生在**切块/入库**阶段：老文档需要**重传**才能受益（重传会按 file_md5 覆盖原 chunk）。
+> 建议优先重传 xlsx/pptx 与包含表格的 PDF。
+
 ### 切块行为修正：首标题前的正文不再丢弃
 
 `src/markdown_preprocessor.py` 以前把第一个标题之前的正文直接 `clear()` 掉 ⇒
@@ -467,6 +549,163 @@ docling_parser:
 
 现在这部分正文挂成一个隐式 section（标题用文档名，无文档名时用「前言」），
 走与其它 section 完全相同的切块 / 清洗 / 入库链路。已入库的老文档行为不变，重传后即可享受修正。
+
+## 长短记忆（会话摘要 + 用户画像）
+
+设计文档：`plans/memory-design.md`。总开关 `memory.enable`，**默认关闭**；
+记忆的任何环节失败都只打日志，**不会把问答带崩**。
+
+### 存什么、不存什么
+
+- 只存**用户本人**的稳定信息：`profile`（是谁 / 做什么领域 / 什么职责）、
+  `preference`（回答风格、范围、格式偏好，例：“回答要简短”“只看 2024 年之后的资料”）。
+- **不存知识库内容**：文档结论一律走检索 + 阈值；进了长期记忆就等于绕过证据边界，是幻觉的制造机。
+- 会话摘要只服务当前会话（存 `chat_session.meta.summary`，不建表），删会话就跟着没了。
+
+### 数据流
+
+```
+提问 → query rewrite → 注入（Tier A 固定画像 + Tier B 语义召回 + 会话摘要）→ 检索/重排 → 回答
+回答入库后 → Celery `tasks.memory_update_task` → 摘要压缩 + 画像抽取（异步，不占 SSE 路径）
+```
+
+- PG 表 `rag_memory` 是**真相**；Qdrant 集 `rag_memory` 只是语义索引（删了可重建，payload 只存
+  `memory_id / user_id / kind / weight`）。注入用的正文永远从 PG 取，向量里有但 PG 里没有有效记录会被跳过。
+- 去重：归一化后的 `content_hash` + 唯一索引 `uq_rag_memory_user_hash(user_id, content_hash)`；
+  重复内容不会堆条目（只累加 `hits`）。与旧条目冲突时，抽取模型可以返 `remove` 把旧条目归档（软删）。
+- 抽取进度记在 `chat_session.meta.memory_extract_cursor`；同一会话的并发靠
+  `meta.memory_lease_at` 租约串行（抢不到就本轮跳过，游标不动 ⇒ 下一轮自动补）。
+- 过期与封顶：`expires_at`（默认 180 天）+ `max_items_per_user`（超了按 `weight, last_used_at` 归档）。
+- 注入的 prompt 结构（记忆为空时完全不出现这些标题）：
+  `## 用户画像与偏好` → `## 相关记忆` → `## 会话摘要` → 原有的 `## 历史对话` / `## 参考资料` / `## 用户当前问题`。
+  摘要是**下一轮**才生效（本轮已经读过了）—— 这是刻意设计，不在 SSE 路径里调 LLM。
+
+### 隐私：完全私有，用户自管
+
+- 每条 SQL 都带 `user_id`，**管理员也不能读别人的记忆**（与 `/sessions` 同一原则）。
+- 网页入口：头像菜单 → 🧠 我的记忆（看全部 / 逐条删 / 一键清空 / 手动补一条）。
+- 接口：`GET /memories`、`POST /memories`、`PUT /memories/{id}`、`DELETE /memories/{id}`、`DELETE /memories`（清空）。
+  这些接口**不受 `memory.enable` 限制** —— 关掉功能后用户依然要能删掉历史记忆。
+
+### token 预算（开记忆前必读）
+
+- `chat.max_total_tokens` = `8192`；记忆段落计入 `trim_context()` 的 reserved，
+  所以它只会挤掉参考资料，不会把 prompt 顶到模型上限外面。
+- ⚠ 本地 ollama 必须把 `num_ctx` 提到 ≥ 8192，否则多余部分被 ollama **静默截断**，
+  表现是“答非所问”而不是报错。
+
+### 成本与队律
+
+- 开 `enable_profile` 后每轮回答多 1 次 LLM 调用（画像抽取）；`enable_summary` 只在历史超过
+  `summary_trigger_ratio × max_total_tokens` 时才多 1 次。
+- 记忆任务与文档**导入共用 celery 队列**：导入大文档时记忆会排队。要隔离就单独起一个 worker，
+  或把这个任务路由到专用队列。
+- `memory_update_task` 只重试 1 次（429 时不放大流量），失败也不抛异常 —— 答案已经返回了。
+
+### 上线顺序与回滚
+
+1. 先跑 `sql/init.sql`（幂等：只建 `rag_memory` 表与两个索引，不动老数据）——
+   **当前开发库已应用**（已核对 14 列 + `idx_rag_memory_user` + `uq_rag_memory_user_hash`）；
+   2.2 跑 `python src/memory_smoke.py` 与 `python src/memory_worker_smoke.py` 确认全通；
+   2.3 worker 要重启一次才加载新代码（`celery -A celery_app inspect registered` 里能看到
+       `tasks.memory_update_task` 就说明已经加载到了）；
+2. `enable: true` + `enable_summary: true`、`enable_profile: false` —— 只看短期摘要；
+3. `enable_profile: true` —— PG 画像（Tier A 固定注入）；
+4. `enable_vector: true` —— Qdrant 语义召回。
+
+出问题按倒序关：向量 → 画像 → 摘要 → 总开关。`enable: false` 后拼出的 prompt 与加记忆前**逐字一致**
+（已用单测比对 md5）。
+
+### 删除语义（三档，别混）
+
+- 用户在网页里删一条 / 清空全部 ⇒ **软删**（`status='archived'` + `meta.user_deleted=true`），向量同时删；
+  之后抽取模型再提到同一内容也**不会把它加回来**（用户删过就是删过，否则用户会觉得“删了又回来”）。
+- 自动去重 / 条目封顶 / TTL 过期 ⇒ 也是 `archived`，但没有 `user_deleted` 标 ⇒ 再被提到会复活（这是想要的）。
+  重新提到同一条时还会**续期** `expires_at`（`GREATEST(旧, 新)`）。
+- 管理员删账号（`DELETE /users/{id}`）⇒ 该用户记忆**硬删** + 删向量（`memory_service.purge_user`）。
+  已知缺口：该用户的 `chat_session` / `chat_message` 目前仍会留在库里（历史行为，待后续补级联）。
+
+### 抽取的两道硬校验（小模型会乱删乱记）
+
+本地 7B 模型实测有两个稳定毛病，都在代码里做了确定性拦截（不是只靠提示词）：
+
+| 毛病 | 表现 | 拦截 |
+|---|---|---|
+| `remove` 不可信 | 问两个 GDP 数字，就把「用户是做财务的」放进 `remove`，那条记忆被归档 | `_remove_supported()`：被删条目的文字必须与本次对话有词面重叠（二元组），或对话里出现「忘掉 / 别再记 / 取消刚才」等明确要求；否则忽略这次 `remove` 并打日志 |
+| 从一次性提问推断偏好 | 问了「2026 Q3 北京 GDP」，就记下「只看 2026 年的资料」 | `_add_supported()`：内容是「只看/仅看 + 年份」这类范围限定时，本次对话必须出现「以后 / 一直 / 总是 / 每次 / 一律…」等长期信号，否则不写 |
+
+两者都会打印可搜的日志：
+`[memory] 忽略无依据的 remove（与本次对话无关）…` / `[memory] 忽略从一次性提问推断出的偏好内容是: …`
+
+正常场景不受影响（已单测）：用户说「以后回答都简短点」⇒ 正常归档旧的、写入新的；
+用户说「忘掉我是做财务的」⇒ 直接允许删。提示词也补了对应规则（第 2、7 条）。
+
+### 网页显示「0 条记忆」怎么排查
+
+`/memories` 只列 `status='active'`；被归档的条目（自动去重 / 条目封顶 / TTL 过期，或用户自己删的）
+**不会出现**，但条数会在接口的 `archived_total` 里返回，前端会在列表为空时提示一句
+「另有 N 条旧记录已被归档」。
+
+```sql
+-- 这个账号到底有没有记忆、什么状态
+SELECT status, COUNT(*) FROM rag_memory
+WHERE user_id = (SELECT user_id FROM rag_user WHERE username = '你的用户名') GROUP BY status;
+
+-- 看是否被自动归档（meta 里没有 user_deleted 就不是你删的）
+SELECT kind, content, status, hits, meta, updated_at FROM rag_memory
+WHERE user_id = (SELECT user_id FROM rag_user WHERE username = '你的用户名')
+ORDER BY updated_at DESC LIMIT 20;
+```
+
+- 想把它弄回来：在任意会话里再用自然语言说一遍同样的偏好即可 —— 抽取命中同一 `content_hash`
+  会**复活**为 `active` 并重新写向量（只有被用户手动删过的才永不复活）。
+- 只想手工救：`PUT /memories/{memory_id}` 带 `{"status":"active"}`（会重新算向量）；
+  直接 SQL 改 `status` 也行，但向量不会回来 ⇒ 只能靠 Tier A 固定注入，语义召回找不到它。
+
+### 冒烟 / 回归脚本（开灰度前先跑这个）
+
+```
+# 1）不经过 Celery：读写、去重、召回、摘要、接口层全跑一遂
+python src/memory_smoke.py
+
+# 2）经过 Celery worker：队列投递 → worker 抽取 → PG/向量双写（脚本头部有跑法：
+#    需要一份 RAG_CONFIG 临时配置 + 一个只吃 smoke_queue 的临时 worker）
+python src/memory_worker_smoke.py
+```
+
+- 连的是 `config.yaml` 里配的那套 PG / Qdrant / embedding / ollama ⇒ **先在 dev 库上跑**。
+- 用一次性用户（`zz_smoke_*`）与一次性会话，跑完自动清干净：PG 条目、Qdrant 向量、会话、临时账号全部删掉。
+- 只在进程内打开开关，**不改 `config.yaml`**（`memory.enable` 保持 false）。
+- ~65 项检查：写入去重与 TTL、语义召回与用户隔离、Tier A/B 注入、抽取与游标、并发租约、
+  滚动摘要、用户自助管理与向量同步、“用户删过的不会被自动加回”、总开关关掉后的行为、
+  `/memories` 接口（鉴权 / 参数校验 / 跳用户隐私 / 删账号时硬清）。
+
+### 事后校准（日志里已经带了记忆字段）
+
+```sql
+-- 本次问答注入了哪些记忆、向量分多少、有没有用摘要
+SELECT meta->'memory_profile_ids', meta->'memory_recall_ids',
+       meta->'memory_scores', meta->'summary_used'
+FROM rag_qa_log ORDER BY created_at DESC LIMIT 50;
+
+-- 哪些记忆真的被用到（hits）、哪些快过期了
+SELECT kind, content, weight, hits, last_used_at, expires_at
+FROM rag_memory WHERE status = 'active' ORDER BY hits DESC LIMIT 30;
+```
+
+- 实测分数分布（冒烟数据：60 字内的记忆条目 + bge-m3）：不相关问题 **0.40~0.43**，
+  相关问题 **0.56~0.58** ⇒ 默认 `recall_min_score: 0.45` 正好落在两者之间的缺口里；
+  上线后再用 `meta.memory_scores` 校准。
+- 召回了一堆不相干的记忆 ⇒ 调高 `memory.recall_min_score`。
+- 画像挤掉了参考资料 ⇒ 调低 `memory.profile_limit`。
+- 想确认抽取质：`SELECT content, meta FROM rag_memory ORDER BY created_at DESC LIMIT 20;`
+  （抽取返回不可解析时不会写条目，只打 worker 日志）。
+
+### eval 口径
+
+`eval/rag_eval.py` 走 `rag_chat(query)`，**默认不带记忆**（与加记忆前同口径，方便比基线）。
+要量“开记忆”的效果：`rag_chat(query, chat_id=..., user_id=...)`（两个都传才启用），
+或直接在网页上问同一个问题对比。
 
 ## 上传文件入库
 ```

@@ -6,7 +6,9 @@ prompt / 检索 / 重排 / 上下文裁剪全部在 `rag_prompt`（D7-b），这
 """
 
 import time
+from typing import Optional
 
+import memory_service
 import rag_prompt
 from chat_store import chat_store
 from chat_window import chat_window
@@ -21,16 +23,30 @@ from settings import settings
 from title_service import generate_title, is_placeholder_title
 
 
-def _should_autotitle(chat_id: str, has_history: bool) -> bool:
-    """只在「新会话的第一问」且标题还是占位值时自动命名。"""
-    if has_history:
+def _should_autotitle(session: Optional[dict], has_history: bool) -> bool:
+    """只在「新会话的第一问」且标题还是占位值时自动命名。
+
+    会话行由调用方取一次传进来（记忆也要用同一行），不要查两遍。
+    """
+    if has_history or not session:
         return False
+    return is_placeholder_title(session.get("title"))
+
+
+def _dispatch_memory_task(user_id: Optional[str], chat_id: str) -> None:
+    """回答结束后异步更新记忆（会话摘要 + 画像抽取）。
+
+    延迟 import：eval（rag_chat / rag_eval）不该被 Celery 与 docling 链路拖起来；
+    提交失败只打日志 —— 记忆是附属能力，不能影响已经返回的答案。
+    """
+    if not memory_service.enabled() or not user_id:
+        return
     try:
-        session = chat_store.get_session(chat_id)
+        from tasks import memory_update_task
+
+        memory_update_task.apply_async(kwargs={"user_id": user_id, "chat_id": chat_id})
     except Exception as e:
-        print(f"[rag_chat_qa] 读取会话失败，跳过自动命名 chat_id={chat_id}: {e}")
-        return False
-    return bool(session) and is_placeholder_title(session.get("title"))
+        print(f"[rag_chat_qa] 记忆任务提交失败（本次不更新记忆）chat_id={chat_id}: {e}")
 
 
 def _apply_title(chat_id: str, query: str):
@@ -53,6 +69,7 @@ def _log_qa(
     stream: bool,
     query_for_search: str = None,
     no_answer: bool = False,
+    memory_ctx=None,
 ):
     """写问答日志（chunk_ids / rerank 分数 / doc_ids + meta）。
 
@@ -82,17 +99,23 @@ def _log_qa(
             },
             # True = 本次没有任何可用参考资料（召回为空或全被阈值刷掉）
             "no_answer": no_answer,
+            # 记忆：用了哪些条目、向量召回分数、是否用到了会话摘要
+            # （事后用 SQL 看分布就能调 memory.recall_min_score / profile_limit）
+            "memory_profile_ids": list(getattr(memory_ctx, "profile_ids", []) or []),
+            "memory_recall_ids": list(getattr(memory_ctx, "recall_ids", []) or []),
+            "memory_scores": list(getattr(memory_ctx, "recall_scores", []) or []),
+            "summary_used": bool(getattr(memory_ctx, "summary", "")),
         },
     )
 
 
-def chat_qa(chat_id: str, query: str):
+def chat_qa(chat_id: str, query: str, user_id: Optional[str] = None):
     """非流式问答：消费 chat_qa_stream，返回与重构前完全一致的字典结构。"""
     answer = ""
     sources = []
     title = None
 
-    for event in chat_qa_stream(chat_id=chat_id, query=query):
+    for event in chat_qa_stream(chat_id=chat_id, query=query, user_id=user_id):
         etype = event.get("type")
         if etype == "sources":
             sources = event.get("sources") or []
@@ -112,8 +135,10 @@ def chat_qa(chat_id: str, query: str):
     return result
 
 
-def chat_qa_stream(chat_id: str, query: str):
-    """流式问答：先做召回/重排/构造 prompt，再逐 token yield。
+def chat_qa_stream(chat_id: str, query: str, user_id: Optional[str] = None):
+    """流式问答：先做记忆/召回/重排/构造 prompt，再逐 token yield。
+
+    `user_id`：不传则从会话行里取（记忆必须知道是谁的 ⇒ 取不到就本次不用记忆）。
 
     yield 的事件为 dict：
       {"type": "sources", "sources": [...]}   # 首帧返回引用来源
@@ -121,15 +146,33 @@ def chat_qa_stream(chat_id: str, query: str):
       {"type": "done", "answer": "...", "chat_id": ...}  # 回答结束
       {"type": "title", "title": "...", "chat_id": ...} # 仅新会话第一问：自动命名的标题
     """
+    # 会话行只取一次：标题（自动命名用）与 user_id（记忆用）共用同一行
+    try:
+        session = chat_store.get_session(chat_id)
+    except Exception as e:
+        print(f"[rag_chat_qa] 读取会话失败 chat_id={chat_id}: {e}")
+        session = None
+    if not user_id:
+        user_id = (session or {}).get("user_id")
+
     t0 = time.time()
 
     # 1. 读取历史 + 裁剪窗口
     raw_history = chat_store.list_messages(chat_id)
     history = chat_window.trim_history(raw_history)
-    autotitle = _should_autotitle(chat_id, has_history=bool(raw_history))
+    autotitle = _should_autotitle(session, has_history=bool(raw_history))
 
-    # 2. query rewrite → 召回 → 重排 → 组装 prompt（全部在 rag_prompt）
-    prepared = rag_prompt.prepare_answer(history=history, query=query)
+    # 2. query rewrite → 记忆 → 召回 → 重排 → 组装 prompt（全部在 rag_prompt）
+    #    记忆要用“改写后的问题”去召回，所以做成回调，由 prepare_answer 在 rewrite 之后调
+    prepared = rag_prompt.prepare_answer(
+        history=history,
+        query=query,
+        memory_provider=(
+            (lambda q: memory_service.load_for_prompt(user_id, chat_id, q))
+            if memory_service.enabled()
+            else None
+        ),
+    )
     query_for_search = prepared.query_for_search if prepared else query
 
     # 3. 没有任何可用参考资料（召回为空 / 全部低于阈值）：固定回答，不调 LLM
@@ -142,6 +185,8 @@ def chat_qa_stream(chat_id: str, query: str):
             query, answer, [], int((time.time() - t0) * 1000), chat_id,
             stream=True, query_for_search=query_for_search, no_answer=True,
         )
+        # 没答上也要跑记忆：用户的问题里往往就带着偏好（“只看 2024 年之后的”）
+        _dispatch_memory_task(user_id, chat_id)
         yield {"type": "sources", "sources": []}
         yield {"type": "delta", "content": answer}
         # 先发 done，再做自动命名：标题生成（LLM）不会拖慢回答的呈现
@@ -170,7 +215,10 @@ def chat_qa_stream(chat_id: str, query: str):
 
     # 7. 写入qa日志
     _log_qa(query, answer, prepared.sources, cost_ms, chat_id, stream=True,
-             query_for_search=query_for_search)
+             query_for_search=query_for_search, memory_ctx=prepared.memory_ctx)
+
+    # 8. 异步更新记忆（摘要 + 画像）：消息已入库，任务里读到的一定是本轮完整对话
+    _dispatch_memory_task(user_id, chat_id)
 
     # 8. 先发 done，再自动命名标题（LLM 调用不阻塞回答呈现）
     yield {"type": "done", "answer": answer, "chat_id": chat_id}
