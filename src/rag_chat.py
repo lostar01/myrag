@@ -11,7 +11,9 @@ query rewrite / 召回 / 重排 / prompt（D7-b），这样 `rag_eval.py` 量到
 """
 
 import time
+from typing import Optional
 
+import memory_service
 import rag_prompt
 from llm_service import llm_service
 from qa_log_service import qa_log_service
@@ -19,11 +21,20 @@ from rag_prompt import DEFAULT_RECALL_TOP_K, DEFAULT_RERANK_TOP_K, NO_ANSWER
 from settings import settings
 
 
-def rag_chat(query: str):
+def rag_chat(query: str, chat_id: Optional[str] = None, user_id: Optional[str] = None):
+    """单轮问答。默认**不带记忆**（与重构前同口径，eval 基线可比）。
+
+    要做“开记忆”的 A/B：传 chat_id + user_id（两个都传才启用），
+    此时会像线上一样注入画像 / 相关记忆 / 会话摘要。
+    """
     t0 = time.time()
 
-    # 召回 + 重排 + 组装 prompt（阈值为空时行为与重构前一致）
-    prepared = rag_prompt.prepare_answer(history=[], query=query)
+    memory_provider = None
+    if chat_id and user_id and memory_service.enabled():
+        memory_provider = lambda q: memory_service.load_for_prompt(user_id, chat_id, q)
+
+    # 召回 + 重排 + 组装 prompt（阈值取 config.yaml 的 retrieval 段）
+    prepared = rag_prompt.prepare_answer(history=[], query=query, memory_provider=memory_provider)
     if prepared is None:
         return {"answer": NO_ANSWER, "sources": []}
 
@@ -48,6 +59,9 @@ def rag_chat(query: str):
                 "cosine_min_score": settings.retrieval.cosine_min_score,
                 "rerank_min_score": settings.retrieval.rerank_min_score,
             },
+            # 开记忆 A/B 时方便对比：本次注入了哪些记忆条目
+            "memory_profile_ids": list(getattr(prepared.memory_ctx, "profile_ids", []) or []),
+            "memory_recall_ids": list(getattr(prepared.memory_ctx, "recall_ids", []) or []),
         },
     )
 

@@ -1493,3 +1493,77 @@ a.user-menu-item {
   background: rgba(16, 163, 127, 0.08);
 }
 
+
+/* ============ 我的记忆（用户端弹窗）============ */
+.memory-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.6;
+  margin-bottom: 10px;
+}
+
+.memory-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 42vh;
+  overflow-y: auto;
+}
+
+.memory-item {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+
+.memory-content {
+  font-size: 14px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.memory-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.memory-kind {
+  padding: 2px 8px;
+  border-radius: 20px;
+  background: var(--bg-hover);
+  font-weight: 500;
+  flex-shrink: 0;
+}
+
+.memory-del {
+  margin-left: auto;
+  padding: 3px 10px;
+  font-size: 12px;
+}
+
+.memory-empty {
+  padding: 18px 0;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.memory-form {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.memory-form-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.memory-form-kind select {
+  width: 96px;
+}

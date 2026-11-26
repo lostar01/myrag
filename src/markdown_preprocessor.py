@@ -60,6 +60,88 @@ class ChunkItem:
     extra_meta: Optional[Dict] = None
 
 
+# ===================== 表格结构工具（P2）=====================
+
+# markdown 表格行：行首有 "|"（docling 导出就是这种）
+_TABLE_LINE_RE = re.compile(r"^\s*\|")
+# 分隔行：|---|---|---|
+_TABLE_SEP_RE = re.compile(r"^\s*\|[\s:\-|]+\|\s*$")
+
+
+def _is_table_line(line: str) -> bool:
+    return bool(_TABLE_LINE_RE.match(line))
+
+
+def _is_table_sep(line: str) -> bool:
+    return bool(_TABLE_SEP_RE.match(line))
+
+
+def _has_table(text: str) -> bool:
+    """是否含真正的 markdown 表格（替代以前 `"|" in text and "\n|" in text` 的猜测）。"""
+    return any(seg["type"] == "table" for seg in _split_segments(text))
+
+
+def _split_segments(text: str) -> List[Dict]:
+    """把 section 正文切成 [{"type": "text"|"table", "text": ...}]，保持原顺序与原文。
+
+    识别为表格的条件：连续以 `|` 开头的行 >= 2 行，且前 3 行里有分隔行（|---|）
+    或者行数够多（docling 导出的大表不一定带分隔行）。识别不出就全部当正文，行为不变。
+    """
+    lines = text.splitlines()
+    segs: List[Dict] = []
+    buf: List[str] = []
+
+    def flush_text():
+        if buf:
+            t = "\n".join(buf)
+            if t.strip():
+                segs.append({"type": "text", "text": t})
+            buf.clear()
+
+    i, n = 0, len(lines)
+    while i < n:
+        if _is_table_line(lines[i]):
+            j = i
+            while j < n and _is_table_line(lines[j]):
+                j += 1
+            block = lines[i:j]
+            looks_table = len(block) >= 2 and (
+                any(_is_table_sep(l) for l in block[:3]) or len(block) >= 4
+            )
+            if looks_table:
+                flush_text()
+                segs.append({"type": "table", "text": "\n".join(block)})
+            else:
+                buf.extend(block)
+            i = j
+            continue
+        buf.append(lines[i])
+        i += 1
+    flush_text()
+    return segs
+
+
+def _table_header(lines: List[str]) -> Tuple[List[str], List[str]]:
+    """拆分「表头/表名前缀」与「数据行」。
+
+    docling 导出的大表常常是多层表头：
+        | 时间：2026年第3季度 | |          ← 表名 / 统计口径
+        |---|---|
+        | 地区生产总值（累计） | ... |      ← 分组表头
+        |---|...|
+        | 地区 | 地区生产总值(亿元) |    ← 真正的列名
+        | 北京市 | 40468 |                ← 数据
+    把「最后一个分隔行之前（含它）」全当表头：每块重复一份，行才看得懂。
+    """
+    last_sep = -1
+    for idx, line in enumerate(lines[:6]):
+        if _is_table_sep(line):
+            last_sep = idx
+    if last_sep >= 0:
+        return lines[: last_sep + 1], lines[last_sep + 1:]
+    return lines[:1], lines[1:]
+
+
 def _page_span_meta(page_start: Optional[int], page_end: Optional[int]) -> Optional[Dict]:
     """跳页时在 extra_meta 里记页范围（同页 / 无页码时不写，避免噪音）。
 
@@ -123,6 +205,12 @@ class MarkdownSectionSplitter:
         root_nodes: List[Node] = []
         md_stack: List[Node] = []
         current_content_buf: List[str] = []
+        # 列表项前缀（bullet / ordered 的标记），遇到列表开始 token 时更新
+        list_marker: str = "-"
+        # 列表嵌套深度（用来判断“当前这段是不是列表项里的段落”）
+        list_depth = [0]
+        # 列表嵌套深度（用来判断“当前这段是不是列表项里的段落”）
+        list_depth = [0]
         # 首标题前的正文（此刻还没有归属 node）
         preamble_buf: List[str] = []
         current_heading_node: Optional[Node] = None
@@ -178,7 +266,27 @@ class MarkdownSectionSplitter:
                 md_stack.append(new_node)
                 current_heading_node = new_node
             else:
+                # 正文拼接：以前是简单 "".join(tok.content)，而 markdown_it 把「列表项 / 段落」
+                # 拆成多个 inline token ⇒ 换行与列表标记全丢：一堆条目被黏成一句，
+                # 混排时表格首行会被黏到上一句末尾（导致表格第一行被当成正文、表头丢失）。
+                # 下面只做「补分隔」：不改变原有文本，只在块结束时补换行、在每个列表项前补标记。
+                if tok.type == "list_item_open":
+                    current_content_buf.append(f"{list_marker} ")
+                elif tok.type in ("bullet_list_open", "ordered_list_open"):
+                    # bullet 的 markup 就是 "-"/"*"；ordered 的 markup 只是 "."，要带序号
+                    list_marker = tok.markup if tok.type == "bullet_list_open" else (tok.markup or ".")
+                    if tok.type == "ordered_list_open":
+                        list_marker = f"1{tok.markup or '.'}"
+                    list_depth[0] += 1
+                elif tok.type in ("bullet_list_close", "ordered_list_close"):
+                    list_depth[0] = max(list_depth[0] - 1, 0)
                 current_content_buf.append(tok.content)
+                # 列表项里的段落不再额外补换行，否则两条之间会多一个空行（白烧 token）
+                if tok.type == "list_item_close":
+                    current_content_buf.append("\n")
+                elif tok.type in ("paragraph_close", "blockquote_close", "fence", "code_block", "hr"):
+                    if list_depth[0] == 0:
+                        current_content_buf.append("\n")
 
         if current_heading_node is not None:
             current_heading_node.content = "".join(current_content_buf).strip()
@@ -282,40 +390,202 @@ class MarkdownSectionSplitter:
         for child in node.children:
             self.dfs_collect_sections(child, out)
 
+    # ---------- P1：按 token 计数、按**原文**切片 ----------
+    def _token_offsets(self, text: str) -> List[Tuple[int, int]]:
+        """拿到每个 token 在原文里的字符区间。
+
+        以前是 encode → decode 重建文本，而 bge-m3 的 XLM-R 分词器带 nmt_nfkc 归一化：
+        重建结果里**换行变空格、全角标点变半角** ⇒ markdown 表格被压成一行、
+        代码块/列表结构丢失、`is_table` 启发式也跟着失效（实测：生产库 41 个带表格的块
+        有 24 个已被压平）。
+
+        不重建就不会变形：切片一律 `text[char_start:char_end]`，换行与全角标点原样保留。
+        拿不到 offset（非 fast 分词器 / 旧版本）时返回空，调用方退回旧的 decode 方式。
+        """
+        try:
+            enc = self.tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+            return list(enc["offset_mapping"])
+        except Exception as e:
+            print(f"[split] 分词器不支持 offset_mapping，退回 decode 切片（会丢失原始换行）: {e}")
+            return []
+
+    @staticmethod
+    def _char_span(offsets: List[Tuple[int, int]], start: int, end: int) -> Optional[Tuple[int, int]]:
+        """token 区间 [start, end) → 原文字符区间（跳过零宽 token）。"""
+        cs = ce = None
+        for k in range(start, min(end, len(offsets))):
+            a, b = offsets[k]
+            if b > a:
+                cs = a
+                break
+        for k in range(min(end, len(offsets)) - 1, start - 1, -1):
+            a, b = offsets[k]
+            if b > a:
+                ce = b
+                break
+        if cs is None or ce is None or ce <= cs:
+            return None
+        return cs, ce
+
+    def _slice_text(self, text: str, offsets, start: int, end: int) -> str:
+        """优先按原文切；没有 offset 时退回 decode。"""
+        if offsets:
+            span = self._char_span(offsets, start, end)
+            if span:
+                return text[span[0]:span[1]]
+        return self.tokenizer.decode(
+            self.tokenizer.encode(text, add_special_tokens=False)[start:end],
+            skip_special_tokens=True,
+        )
+
+    def _window_split(
+        self,
+        text: str,
+        sec_item: Dict,
+        eff_page_no: Optional[int],
+        span_meta: Optional[Dict],
+        is_table: bool = False,
+        row_span: Optional[List[int]] = None,
+    ) -> List[ChunkItem]:
+        """滑动窗口切块（P1：窗口边界仍按 token，但取的都是原文，不再 decode 重建）。"""
+        tokens = self.tokenizer.encode(text, add_special_tokens=False)
+        offsets = self._token_offsets(text)
+        # offset 数量应与 token 数一致（fast 分词器就是一致的），不一致就不用它，避免错位
+        if offsets and len(offsets) != len(tokens):
+            print(f"[split] offset({len(offsets)}) 与 token({len(tokens)}) 不一致，本段改用 decode")
+            offsets = []
+
+        chunks: List[ChunkItem] = []
+        start = 0
+        while start < len(tokens):
+            end = min(start + CHUNK_SIZE, len(tokens))
+            chunk_text = self._slice_text(text, offsets, start, end)
+            chunk_len = len(self.tokenizer.encode(chunk_text, add_special_tokens=False))
+            if chunk_len >= MIN_CHUNK_TOKEN:
+                meta = dict(span_meta) if span_meta else {}
+                if row_span:
+                    meta["row_span"] = list(row_span)
+                chunks.append(ChunkItem(
+                    chunk_id=str(uuid.uuid4()),
+                    content_md=chunk_text,
+                    section_path=sec_item["section_path"],
+                    title_num=sec_item["title_num"],
+                    title=sec_item["title"],
+                    level=sec_item["md_level"],
+                    page_no=eff_page_no,
+                    is_table=is_table,
+                    token_len=chunk_len,
+                    extra_meta=meta or None,
+                ))
+            if end >= len(tokens):
+                break
+            start = start + CHUNK_SIZE - OVERLAP
+        return chunks
+
+    def _table_chunks(
+        self,
+        table_text: str,
+        sec_item: Dict,
+        eff_page_no: Optional[int],
+        span_meta: Optional[Dict],
+        table_index: int,
+    ) -> List[ChunkItem]:
+        """P2：表格按**整行**分组，每块重复表头（绝不切断行、不丢列名）。
+
+        以前一张 300 行的表被 700-token 窗一刃切：第 2 块起没有表头，
+        `| 广东省 | 111091 |` 这种块里没有任何列语义，问“广东的生产总值”召不回来。
+        现在改成：表头行 + 一整组数据行，行范围写进 extra_meta.row_span。
+        """
+        lines = [l for l in table_text.splitlines() if l.strip()]
+        header, rows = _table_header(lines)
+        header_text = "\n".join(header) if header else ""
+        header_tokens = len(self.tokenizer.encode(header_text, add_special_tokens=False)) if header_text else 0
+        budget = max(CHUNK_SIZE - header_tokens, MIN_CHUNK_TOKEN)
+
+        chunks: List[ChunkItem] = []
+        buf: List[str] = []
+        used = 0
+        # group_start：buf 里第一行在 rows 里的下标（0-based）
+        group_start = 0
+
+        def flush(end_exclusive: int):
+            """把 buf 写出为一个 chunk，行范围 = [group_start+1, end_exclusive]（1-based，闭区间）。"""
+            nonlocal buf, used
+            if not buf:
+                return
+            body = "\n".join(buf)
+            content = f"{header_text}\n{body}" if header_text else body
+            tok_len = len(self.tokenizer.encode(content, add_special_tokens=False))
+            if tok_len >= MIN_CHUNK_TOKEN:
+                meta = dict(span_meta) if span_meta else {}
+                meta["row_span"] = [group_start + 1, end_exclusive]
+                meta["table_index"] = table_index
+                chunks.append(ChunkItem(
+                    chunk_id=str(uuid.uuid4()),
+                    content_md=content,
+                    section_path=sec_item["section_path"],
+                    title_num=sec_item["title_num"],
+                    title=sec_item["title"],
+                    level=sec_item["md_level"],
+                    page_no=eff_page_no,
+                    is_table=True,
+                    token_len=tok_len,
+                    extra_meta=meta,
+                ))
+            buf, used = [], 0
+
+        i = 0
+        while i < len(rows):
+            row = rows[i]
+            row_tok = len(self.tokenizer.encode(row + "\n", add_special_tokens=False))
+            if row_tok > budget:
+                # 单行就超预算（极宽的表格）：这一行单独成块，绝不切行
+                flush(i)
+                group_start = i
+                buf, used = [row], row_tok
+                flush(i + 1)
+                group_start = i + 1
+                i += 1
+                continue
+            if buf and used + row_tok > budget:
+                flush(i)
+                group_start = i
+            buf.append(row)
+            used += row_tok
+            i += 1
+        flush(len(rows))
+        return chunks
+
     def sliding_split(self, sec_item: Dict, page_no: int = None) -> List[ChunkItem]:
+        """按「表格块 / 正文段」分段切块（P1 + P2）。
+
+        - 正文段：token 滑窗，但取原文切片 ⇒ 换行/全角标点/列表结构不再被抹平；
+        - 表格块：按整行分组 + 每块重复表头，`is_table=True`、`extra_meta.row_span=[起,止]`。
+        跳页时的 `page_span` 仍按 section 级写入（与以前一致）。
+        """
         text = sec_item["content"]
-        section_path = sec_item["section_path"]
-        title_num = sec_item["title_num"]
-        title = sec_item["title"]
-        md_level = sec_item["md_level"]
-        # 页码：窗口级别的精确页算不出来，统一用 section 起始页 + section 页范围
         sec_page_start = sec_item.get("page_start")
         sec_page_end = sec_item.get("page_end")
         eff_page_no = page_no if page_no is not None else sec_page_start
         span_meta = _page_span_meta(sec_page_start, sec_page_end)
-        chunks = []
-        tokens = self.tokenizer.encode(text, add_special_tokens=False)
-        start = 0
-        while start < len(tokens):
-            end = min(start + CHUNK_SIZE, len(tokens))
-            chunk_tokens = tokens[start:end]
-            chunk_text = self.tokenizer.decode(chunk_tokens, skip_special_tokens=True)
-            chunk_len = len(chunk_tokens)
-            if chunk_len >= MIN_CHUNK_TOKEN:
-                chunks.append(ChunkItem(
-                    chunk_id=str(uuid.uuid4()),
-                    content_md=chunk_text,
-                    section_path=section_path,
-                    title_num=title_num,
-                    title=title,
-                    level=md_level,
-                    page_no=eff_page_no,
-                    is_table="|" in chunk_text and "\n|" in chunk_text,
-                    token_len=chunk_len,
-                    # 每个 chunk 拷一份 meta，后面 attach_doc_global_meta 会 update 而不是覆盖
-                    extra_meta=dict(span_meta) if span_meta else None,
+
+        segments = _split_segments(text)
+        has_table = any(s["type"] == "table" for s in segments)
+        if not has_table:
+            return self._window_split(text, sec_item, eff_page_no, span_meta, is_table=False)
+
+        chunks: List[ChunkItem] = []
+        table_index = 0
+        for seg in segments:
+            if seg["type"] == "table":
+                table_index += 1
+                chunks.extend(self._table_chunks(
+                    seg["text"], sec_item, eff_page_no, span_meta, table_index
                 ))
-            start = start + CHUNK_SIZE - OVERLAP
+            elif seg["text"].strip():
+                chunks.extend(self._window_split(
+                    seg["text"], sec_item, eff_page_no, span_meta, is_table=False
+                ))
         return chunks
 
     def split_markdown(
@@ -362,7 +632,7 @@ class MarkdownSectionSplitter:
                     title=sec["title"],
                     level=sec["md_level"],
                     page_no=page_no if page_no is not None else sec.get("page_start"),
-                    is_table="|" in sec["content"] and "\n|" in sec["content"],
+                    is_table=_has_table(sec["content"]),
                     token_len=sec_token_cnt,
                     extra_meta=_page_span_meta(sec.get("page_start"), sec.get("page_end")),
                 ))

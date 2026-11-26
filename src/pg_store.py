@@ -228,6 +228,27 @@ class PGChunkStore:
                 rows = cur.fetchall()
                 return {r["chunk_id"]: dict(r) for r in rows}
 
+    def get_memories_by_ids(self, memory_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+        """批量按 memory_id 取记忆内容，返回 {memory_id: row}（照搬 get_chunks_by_ids 的写法）。
+
+        Qdrant 只存向量与最小 payload，召回后靠这个回 PG 取正文，避免 N+1 查询。
+        只返回 active 且未过期的条目：向量集里理论上不该有它们，这里再兑一层。
+        """
+        if not memory_ids:
+            return {}
+        sql = """
+        SELECT memory_id, kind, content, weight, hits, last_used_at, created_at
+        FROM rag_memory
+        WHERE memory_id = ANY(%s)
+          AND status = 'active'
+          AND (expires_at IS NULL OR expires_at > NOW())
+        """
+        with self.get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql, (list(memory_ids),))
+                rows = cur.fetchall()
+                return {r["memory_id"]: dict(r) for r in rows}
+
     def get_chunk_by_id(self, chunk_id: str):
         sql = """
         SELECT chunk_id, doc_id, section_path, title, title_num, level, page_no, is_table, token_len, content_md

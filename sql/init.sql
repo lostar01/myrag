@@ -1,8 +1,8 @@
 -- ============================================================================
 -- RAG 知识库 · PostgreSQL 建表脚本（幂等，可重复执行）
 -- ============================================================================
--- 在全新环境初始化数据库（二选一）：
---   psql "postgresql://raguser:Rag%23123456@127.0.0.1:5432/rag_db" -f sql/init.sql
+-- 在全新环境初始化数据库（二选一，口令走环境变量，不要写进命令行 / 文件 / shell 历史）：
+--   PGPASSWORD='<口令>' psql -h 127.0.0.1 -U raguser -d rag_db -f sql/init.sql
 --   docker exec -i postgres psql -U raguser -d rag_db < sql/init.sql
 --
 -- 脚本结构：
@@ -167,6 +167,37 @@ CREATE INDEX IF NOT EXISTS idx_rag_qa_log_created_at ON rag_qa_log(created_at);
 
 
 -- ============================================================================
+-- 4.5 记忆（用户画像 / 偏好）
+--     短期会话摘要不建表（存 chat_session.meta）；长期记忆只存“用户本人稳定信息”，
+--     不存知识库事实（防止长期记忆污染检索边界）。
+--     真相在 PG；Qdrant 集 rag_memory 只是语义索引（point id = memory_id）。
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS rag_memory (
+    memory_id      VARCHAR(64) PRIMARY KEY,
+    user_id        VARCHAR(64) NOT NULL,
+    kind           VARCHAR(16) NOT NULL,          -- profile（身份/领域/职责）/ preference（风格、范围、格式偏好）
+    content        TEXT NOT NULL,                 -- 单条 ≤ memory.profile_max_chars 字
+    content_hash   VARCHAR(64) NOT NULL,          -- 归一化后 md5 ⇒ 同一条画像说多遍只存一条
+    weight         REAL DEFAULT 0.5,              -- 0~1；抽取时 LLM 给，命中时不抬高（只记 hits）
+    hits           INTEGER DEFAULT 0,
+    last_used_at   TIMESTAMP,
+    expires_at     TIMESTAMP,                     -- 到期不再注入（防长期污染）
+    status         VARCHAR(16) DEFAULT 'active',  -- active / archived（软删，Qdrant 里的点同步删）
+    source_chat_id VARCHAR(64),
+    meta           JSONB DEFAULT '{}'::jsonb,
+    created_at     TIMESTAMP DEFAULT NOW(),
+    updated_at     TIMESTAMP DEFAULT NOW()
+);
+
+-- 固定注入核心画像时走这个索引；完全按 user 隔离，没有任何管理员旁路
+CREATE INDEX IF NOT EXISTS idx_rag_memory_user
+    ON rag_memory(user_id, status, weight DESC, last_used_at DESC);
+-- 去重依赖它（ON CONFLICT (user_id, content_hash)），跟 uq_rag_doc_file_md5 同思路
+CREATE UNIQUE INDEX IF NOT EXISTS uq_rag_memory_user_hash ON rag_memory(user_id, content_hash);
+
+
+-- ============================================================================
 
 
 -- ============================================================================
@@ -278,6 +309,12 @@ END $$;
 -- ============================================================================
 
 COMMENT ON COLUMN rag_user.token_epoch     IS 'token 撤销水位（epoch 秒）：token 的 iat 小于该值即失效；改密/改角色/禁用时更新';
+
+COMMENT ON TABLE  rag_memory                   IS '用户长期记忆（仅画像/偏好；PG 为真相，Qdrant rag_memory 集只做语义索引）';
+COMMENT ON COLUMN rag_memory.kind              IS 'profile=身份/领域/职责, preference=风格/范围/格式偏好';
+COMMENT ON COLUMN rag_memory.content_hash      IS '归一化(去空白+大小写)后 md5，同用户去重靠它（ON CONFLICT）';
+COMMENT ON COLUMN rag_memory.expires_at        IS '到期不再注入 prompt；默认 created_at + memory.default_ttl_days';
+COMMENT ON COLUMN rag_memory.status            IS 'active / archived（软删，同时删 Qdrant 向量点）';
 
 COMMENT ON TABLE  rag_chunk                IS 'RAG文档分块结构化存储';
 COMMENT ON COLUMN rag_chunk.chunk_id       IS 'chunk唯一uuid，和qdrant point id一致';

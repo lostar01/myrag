@@ -108,6 +108,37 @@ class RetrievalSettings(BaseSettings):
     cosine_min_score: float = 0.35
     rerank_min_score: float = 0.10
 
+class MemorySettings(BaseSettings):
+    """长短记忆（会话摘要 + 用户画像）总配置。默认全关。
+
+    - enable=false ⇒ prompt 里不会出现任何记忆段落，行为与加记忆之前逐字一致；
+    - 灰度顺序：enable=true → short_term.enable_summary → long_term.enable_profile
+      → long_term.enable_vector；出问题只回退一层。
+    记忆任何环节失败都只打日志，不影响问答主链路。
+
+    注：env_prefix 显式设成 RAG_MEMORY_，避免 enable 这种短字段名被环境变量误顶。
+    """
+    model_config = SettingsConfigDict(env_prefix="RAG_MEMORY_")
+
+    enable: bool = False                                  # 总开关
+    qdrant_collection_name: str = "rag_memory"            # 记忆向量集（与文档集分开）
+
+    enable_summary: bool = True        # 短期：会话滚动摘要（enable=true 时生效）
+    keep_recent_turns: int = 6         # 最近 N 轮永远当原文，不进摘要
+    summary_trigger_ratio: float = 0.6 # 历史估算 token 超过 ratio×max_total_tokens 才压
+    summary_max_tokens: int = 400      # 摘要本身的 token 上限
+
+    enable_profile: bool = True        # 长期：画像/偏好条目（PG）+ 异步抽取
+    enable_vector: bool = True         # 长期：语义召回（Qdrant）
+    profile_limit: int = 12            # 固定注入的核心画像条数
+    profile_max_chars: int = 60        # 单条字数上限
+    recall_top_k: int = 4              # 语义召回条数
+    recall_min_score: float = 0.45     # 记忆条目是短文本，分数分布与文档块不同，单独调
+    max_items_per_user: int = 200      # 超出后按 (weight, last_used_at) 归档
+    default_ttl_days: int = 180        # expires_at 默认值，防长期污染
+    max_new_items: int = 5             # 单次抽取最多写入几条
+
+
 class QdrantSettings(BaseSettings):
     host: str
     port: int
@@ -169,6 +200,8 @@ class AppSettings(BaseSettings):
     celery: CelerySettings
     # 必须有默认值，否则旧 config.yaml 没有 retrieval 段会直接加载失败
     retrieval: RetrievalSettings = RetrievalSettings()
+    # 必须有默认值，否则旧 config.yaml 没有 memory 段会直接加载失败
+    memory: MemorySettings = MemorySettings()
     # 必须有默认值，否则旧 config.yaml 没有 upload 段会直接加载失败
     upload: UploadSettings = UploadSettings()
 
