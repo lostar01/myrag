@@ -5,8 +5,17 @@ from settings import settings
 class ChatWindowManager:
     def __init__(self):
         # 从配置读取
-        self.max_total_tokens = settings.chat.max_total_tokens  # 比如 8192
+        self.max_total_tokens = settings.chat.max_total_tokens  # 比如 16384
+        # 历史对话最多占窗口的比例。以前 trim_history 拿整个窗口当预算，
+        # 历史一长就把参考资料预算吃成 0（trim_context 直接返回 []）⇒ 上下文里只剩历史。
+        self.history_ratio = float(getattr(settings.chat, "history_ratio", 0.25) or 0.25)
         self.encoding = tiktoken.get_encoding("cl100k_base")
+
+    @property
+    def history_budget(self) -> int:
+        """历史对话可用的 token 上限（至少留 1/4 窗口给参考资料）。"""
+        ratio = min(max(self.history_ratio, 0.0), 0.9)
+        return max(int(self.max_total_tokens * ratio), 256)
 
     def count_tokens(self, text: str) -> int:
         return len(self.encoding.encode(text))
@@ -25,10 +34,8 @@ class ChatWindowManager:
         return list(reversed(keep))
 
     def trim_history(self, history: List[Dict]) -> List[Dict]:
-        """history: [{"role":"user","content":"xxx"}, ...]
-        从头部开始删，直到总token不超限
-        """
-        return self.fit_history(history, self.max_total_tokens)
+        """按 `chat.history_ratio` 预算裁剪历史（不再独占整个窗口）。"""
+        return self.fit_history(history, self.history_budget)
 
     def split_history(
         self,
@@ -45,7 +52,7 @@ class ChatWindowManager:
         原文比摘要可靠，摘要只兜“更早的部分”；为此超一点预算也值得，
         真不够用时由 trim_context 那边去收缩参考资料。
         """
-        effective_budget = self.max_total_tokens if budget is None else budget
+        effective_budget = self.history_budget if budget is None else budget
         kept = self.fit_history(history, effective_budget)
         cut = len(history) - len(kept)
         dropped = history[:max(cut, 0)]

@@ -69,15 +69,18 @@ llm:
   base_url: "http://127.0.0.1:11434/v1"
   # 密钥：CHANGE_ME。Ollama 这类本地服务不校验，填 "ollama" 即可
   api_key: "CHANGE_ME__llm_api_key"
-  model_name: "qwen2.5:latest"
+  model_name: "qwen2.5-16k"
 
 # chat模块
 chat:
-  # 历史 + 问题 + 模板 + 参考资料 的总 token 预算（注意：按 tiktoken 估算，不是模型真实口径）
-  # 开记忆（会话摘要 + 画像）后记忆段落也要吃预算，默认 4096 不够用 ⇒ 调到 8192。
-  # ⚠ ollama 跑 qwen2.5 时服务端 num_ctx 默认可能只有 4096，必须至少 8192，
-  #    否则模型自己截断，表现为“丢上下文/答非所问”，比不开记忆还难查。
-  max_total_tokens: 8192
+  # 历史 + 问题 + 模板 + 参考资料 的总 token 预算（按 tiktoken 估算，不是模型真实口径）
+  # 12 条 × 700 token ≈ 8.3k，还要留历史/模板/生成空间 ⇒ 16384。
+  # ⚠ 必须同步把 ollama 的 num_ctx 提到 16384，否则模型自己截断（实测默认只有 4096：
+  #    5.5k token 还能记住开头的暗号，8k 就丢了）。做法见 Readme「上下文窗口」一节。
+  max_total_tokens: 16384
+  # 历史对话最多占窗口的比例（剩余留给参考资料）。
+  # 以前 trim_history 拿整个窗口当预算 ⇒ 历史一长就把参考资料挤成 0 条。
+  history_ratio: 0.25
 
 # 鉴权模块（token 签名参数）
 auth:
@@ -105,6 +108,28 @@ retrieval:
   # 官方模型卡实例分数：相关对 0.9948，不相关对 0.000278 / 0.0035 ⇒ 0.10 够剔明显不相关。
   # 事后看 rag_qa_log.meta.cosine_scores / meta.thresholds 再定标。
   rerank_min_score: 0.10
+
+  # ---------- 多文档覆盖（上下文选择）----------
+  # 召回就按文档分组（Qdrant group_by=doc_id）。实测：普通召回 limit=40 只覆盖 3 篇文档，
+  # 分组召回能把 12 个槽位铺到 12 篇文档上，耗时相同（0.04~0.09s）。
+  group_by_doc: true
+  recall_groups: 16          # 召回多少个文档组（槽位 12 + 4 组余量）
+  group_size: 2              # 每组取几条：单证据查询时同一篇文档还能出第 2 条
+  # rerank 分批条数：TEI max_batch_tokens=16384，chunk p50≈700 ⇒ 16×700=11200 安全，24 条就超
+  rerank_batch_size: 16
+
+  # 选择策略：
+  #   score     = 旧行为，纯分数截断（一键回退 / 基线）
+  #   doc_quota = 按文档配额两遍填充（先每文档 1 条铺满，再补第 2 条）
+  #   coverage  = 子模覆盖贪心（设施选址 + 冗余惩罚 + token 预算）
+  #   adaptive  = 候选里“有效不同文档数 >= 槽位” ⇒ 走 score；否则走 coverage（推荐）
+  # 依据：多样化在“干净候选池”上反而有害，只在候选池冗余、任务需要多条证据时才有益
+  #       （arXiv 2610.09412）。adaptive 会自动规避这种伤害。
+  selector: "adaptive"
+  per_doc_max_chunk: 2       # 单文档最多几条：防止被一篇长文档占满
+  diversity_lambda: 0.3      # 冗余惩罚权重：调大更“多样”但伤相关性，0.2~0.5 合理
+  # 参考资料顺序：score（纯分数） / lost_in_middle（最强证据放首与末，减轻中间位置被忽略）
+  context_order: "lost_in_middle"
 
 # qdrant模块
 qdrant:

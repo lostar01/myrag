@@ -67,6 +67,9 @@ class LlmSettings(BaseSettings):
 
 class ChatSettings(BaseSettings):
     max_total_tokens: int
+    # 历史对话最多占总窗口的比例。以前 trim_history 拿“整个窗口”当预算，
+    # 历史一长就把参考资料挤成 0 条 ⇒ 必须单独给历史上限。
+    history_ratio: float = 0.25
 
 
 class AuthSettings(BaseSettings):
@@ -107,6 +110,21 @@ class RetrievalSettings(BaseSettings):
     rerank_top_n: int = 3
     cosine_min_score: float = 0.35
     rerank_min_score: float = 0.10
+
+    # ---------- 上下文选择（多文档多 chunk 时保住“多源覆盖”）----------
+    # 召回阶段直接按文档分组（Qdrant group_by），避免“12 条全来自 2 篇文档”。
+    group_by_doc: bool = True
+    recall_groups: int = 16      # 召回多少个文档组（槽位 12 + 4 组余量）
+    group_size: int = 2         # 每组取几条（单证据查询时同文档还能出第 2 条）
+    # rerank 分批条数：TEI max_batch_tokens=16384，chunk p50=700 ⇒ 16×700=11200 安全，24 条就超
+    rerank_batch_size: int = 16
+
+    # 选择策略：score（旧行为）/ doc_quota（按文档配额）/ coverage（子模覆盖）/ adaptive（自动）
+    selector: str = "adaptive"
+    per_doc_max_chunk: int = 2   # 单文档最多几条（防被单文档占满）
+    diversity_lambda: float = 0.3  # 冗余惩罚权重；过大退化成纯多样性、会伤相关性
+    # 参考资料顺序：score（纯分数）/ lost_in_middle（最强证据放首与末，减轻位置偏差）
+    context_order: str = "lost_in_middle"
 
 class MemorySettings(BaseSettings):
     """长短记忆（会话摘要 + 用户画像）总配置。默认全关。
