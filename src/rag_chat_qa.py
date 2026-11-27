@@ -16,7 +16,7 @@ from llm_service import llm_service
 from qa_log_service import qa_log_service
 from rag_prompt import (
     DEFAULT_RECALL_TOP_K,
-    DEFAULT_RERANK_TOP_K,
+    DEFAULT_RERANK_TOP_N,
     NO_ANSWER,
 )
 from settings import settings
@@ -86,7 +86,7 @@ def _log_qa(
         cost_ms=cost_ms,
         meta={
             "top_k_recall": DEFAULT_RECALL_TOP_K,
-            "top_k_rerank": DEFAULT_RERANK_TOP_K,
+            "top_k_rerank": DEFAULT_RERANK_TOP_N,
             "chat_id": chat_id,
             "stream": stream,
             # 实际用于检索的问题（多轮时可能是改写后的），方便事后排查召回问题

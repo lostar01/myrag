@@ -33,7 +33,7 @@ window = chat_window.chat_window
 # top_k 来自 config.yaml 的 retrieval 段（#6）。
 # 模块级常量保留：问答日志的 meta 里要写这两个值，rag_chat / rag_chat_qa 都仍从这里取。
 DEFAULT_RECALL_TOP_K = settings.retrieval.recall_top_k
-DEFAULT_RERANK_TOP_K = settings.retrieval.rerank_top_k
+DEFAULT_RERANK_TOP_N = settings.retrieval.rerank_top_n
 
 # 检索不到内容 / 全部低于阈值时的固定回答
 NO_ANSWER = "知识库中未找到相关内容"
@@ -135,7 +135,7 @@ def rewrite_query(history: List[Dict], query: str) -> str:
 def retrieve_and_rerank(
     query: str,
     recall_top_k: Optional[int] = None,
-    rerank_top_k: Optional[int] = None,
+    rerank_top_n: Optional[int] = None,
     cosine_min_score: Optional[float] = None,
     rerank_min_score: Optional[float] = None,
 ) -> List[Dict]:
@@ -149,7 +149,7 @@ def retrieve_and_rerank(
     return rerank_client.rerank(
         query,
         recall_chunks,
-        top_n=rerank_top_k if rerank_top_k is not None else DEFAULT_RERANK_TOP_K,
+        top_n=rerank_top_n if rerank_top_n is not None else DEFAULT_RERANK_TOP_N,
         min_score=rerank_min_score,
     )
 
@@ -205,7 +205,7 @@ def prepare_answer(
     history: List[Dict],
     query: str,
     recall_top_k: Optional[int] = None,
-    rerank_top_k: Optional[int] = None,
+    rerank_top_n: Optional[int] = None,
     cosine_min_score: Optional[float] = None,
     rerank_min_score: Optional[float] = None,
     memory_provider: Optional[Callable[[str], object]] = None,
@@ -241,7 +241,7 @@ def prepare_answer(
     sources = retrieve_and_rerank(
         query_for_search,
         recall_top_k=recall_top_k,
-        rerank_top_k=rerank_top_k,
+        rerank_top_n=rerank_top_n,
         cosine_min_score=cosine_min_score,
         rerank_min_score=rerank_min_score,
     )

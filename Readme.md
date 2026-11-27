@@ -426,7 +426,7 @@ upload:
 ```yaml
 retrieval:
   recall_top_k: 6        # 向量召回条数
-  rerank_top_k: 3        # 重排后送给 LLM 的条数
+  rerank_top_n: 3        # 重排后送给 LLM 的条数
   cosine_min_score: 0.35 # 余弦下限（0 = 关闭过滤）
   rerank_min_score: 0.10 # 重排分下限（0 = 关闭过滤）
 ```
