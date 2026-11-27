@@ -139,7 +139,7 @@ def rewrite_query(history: List[Dict], query: str) -> str:
 def retrieve_and_rerank(
     query: str,
     recall_top_k: Optional[int] = None,
-    rerank_top_k: Optional[int] = None,
+    rerank_top_n: Optional[int] = None,
     cosine_min_score: Optional[float] = None,
     rerank_min_score: Optional[float] = None,
     with_vectors: bool = False,
@@ -153,7 +153,12 @@ def retrieve_and_rerank(
                              with_vectors=with_vectors)
     if not recall_chunks:
         return []
-    return rerank_client.rerank_all(query, recall_chunks, min_score=rerank_min_score)
+    return rerank_client.rerank(
+        query,
+        recall_chunks,
+        top_n=rerank_top_n if rerank_top_n is not None else DEFAULT_RERANK_TOP_N,
+        min_score=rerank_min_score,
+    )
 
 
 def build_context_line(item: Dict) -> str:
@@ -215,7 +220,7 @@ def prepare_answer(
     history: List[Dict],
     query: str,
     recall_top_k: Optional[int] = None,
-    rerank_top_k: Optional[int] = None,
+    rerank_top_n: Optional[int] = None,
     cosine_min_score: Optional[float] = None,
     rerank_min_score: Optional[float] = None,
     memory_provider: Optional[Callable[[str], object]] = None,
@@ -255,6 +260,7 @@ def prepare_answer(
     candidates = retrieve_and_rerank(
         query_for_search,
         recall_top_k=recall_top_k,
+        rerank_top_n=rerank_top_n,
         cosine_min_score=cosine_min_score,
         rerank_min_score=rerank_min_score,
         with_vectors=need_vectors,
