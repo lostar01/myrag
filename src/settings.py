@@ -104,7 +104,7 @@ class RetrievalSettings(BaseSettings):
     事后可以从 rag_qa_log.meta.cosine_scores 看真实分布再定标。
     """
     recall_top_k: int = 6
-    rerank_top_k: int = 3
+    rerank_top_n: int = 3
     cosine_min_score: float = 0.35
     rerank_min_score: float = 0.10
 
