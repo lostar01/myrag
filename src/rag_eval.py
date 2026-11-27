@@ -1,13 +1,26 @@
 import json
+import os
+import sys
 import time
 from typing import List, Dict
 from dataclasses import dataclass
+
+# 允许先设环境变量再 import（选择策略在模块级读取配置，import 之后改 settings 不会影响
+# DEFAULT_RERANK_TOP_N 这类模块级常量，所以这里用 RAG_EVAL_SELECTOR 提前覆盖）
+_SELECTOR = os.environ.get("RAG_EVAL_SELECTOR", "").strip()
+if _SELECTOR:
+    os.environ["RAG_EVAL_APPLY_SELECTOR"] = _SELECTOR
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from settings import settings as _s
+    _s.retrieval.selector = _SELECTOR
+
 from rag_chat import rag_chat
 from llm_service import llm_service
 
 # ===================== 配置 =====================
 TEST_SET_PATH = "../eval/test_set.json"
-REPORT_PATH = "../eval/report.json"
+# RAG_EVAL_REPORT 可指定输出文件，用来做「四种选择策略」的分组对比，互不覆盖
+REPORT_PATH = os.environ.get("RAG_EVAL_REPORT", "../eval/report.json")
 # 评估打分prompt 重点：JSON的{}写成{{}}
 EVAL_PROMPT_TPL = """
 你是RAG评估器，严格判断【模型回答】是否基于【参考上下文】，同时对比【预期标准答案】。
@@ -99,6 +112,8 @@ def run_eval():
             "expected_answer": item.expected_answer,
             "model_answer": model_ans,
             "retrieved_chunk_ids": retrieved_chunk_ids,
+            "docs_selected": len({s.get("doc_id") for s in sources if s.get("doc_id")}),
+            "context_chunks": len(sources),
             "required_chunk_ids": item.required_chunk_ids,
             "all_required_hit": all_required_hit,
             "is_correct": eval_res["is_correct"],
@@ -115,8 +130,7 @@ def run_eval():
 
     report = {
         "meta":{
-            "top_k_recall":6,
-            "top_k_rerank":3,
+            "selector": os.environ.get("RAG_EVAL_SELECTOR", "config 默认"),
             "chunk_size":700,
             "overlap":120
         },

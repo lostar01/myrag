@@ -6,10 +6,11 @@
 
     history_to_text()        历史消息 → "role: content\n" 文本
     rewrite_query()          多轮对话下把当前问题改写成独立可检索的问题
-    build_context_lines()    参考资料行（页码为空时省略，见 #4）
+    build_context_line()     一条参考资料（来源文档名 + 章节 + 页码 + 正文）
+    build_context_lines()    参考资料行列表（页码为空时省略，见 #4）
     assemble_prompt()        拼最终 prompt
-    retrieve_and_rerank()    向量召回 + 重排（阈值见 #6）
-    prepare_answer()         上面全套串起来，返回 prompt + 引用来源
+    retrieve_and_rerank()    向量召回 + 重排（阈值见 #6）；**不截断**，选择交给 context_selector
+    prepare_answer()         上面全套串起来：rewrite → 记忆 → 召回 → 重排 → 选择 → 排序 → prompt
 
 `rag_chat_qa.py` 只负责流式事件、写库、日志与自动命名；
 `rag_chat.py`（eval 用）也走同一套，不再自己拼 prompt。
@@ -22,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
 import chat_window
+import context_selector
 from llm_service import llm_service
 from retrieval import retrieve
 from rerank_client import rerank_client
@@ -33,7 +35,7 @@ window = chat_window.chat_window
 # top_k 来自 config.yaml 的 retrieval 段（#6）。
 # 模块级常量保留：问答日志的 meta 里要写这两个值，rag_chat / rag_chat_qa 都仍从这里取。
 DEFAULT_RECALL_TOP_K = settings.retrieval.recall_top_k
-DEFAULT_RERANK_TOP_K = settings.retrieval.rerank_top_k
+DEFAULT_RERANK_TOP_N = settings.retrieval.rerank_top_n
 
 # 检索不到内容 / 全部低于阈值时的固定回答
 NO_ANSWER = "知识库中未找到相关内容"
@@ -107,6 +109,8 @@ class PreparedAnswer:
     memory_block: str = ""
     # 记忆上下文（memory_service.MemoryContext 或 None），只给写日志用
     memory_ctx: object = None
+    # 上下文选择的统计（覆盖了几篇文档、预算丢了多少 …），写日志用
+    selection: Optional[Dict] = None
 
 
 def history_to_text(history: List[Dict]) -> str:
@@ -138,35 +142,41 @@ def retrieve_and_rerank(
     rerank_top_k: Optional[int] = None,
     cosine_min_score: Optional[float] = None,
     rerank_min_score: Optional[float] = None,
+    with_vectors: bool = False,
 ) -> List[Dict]:
-    """向量召回 + 重排（阈值默认取 config.yaml 的 retrieval 段，#6）。
+    """向量召回 + 重排，**不截断**（截断/选择交给 `context_selector`）。
 
     召回为空、或重排后全被阈值刷掉 ⇒ 返回 []（调用方走“未找到”分支）。
+    `with_vectors=True` 时每条候选带 chunk 向量，供覆盖贪心算冗余度（无需重新 embedding）。
     """
-    recall_chunks = retrieve(query, top_k=recall_top_k, score_threshold=cosine_min_score)
+    recall_chunks = retrieve(query, top_k=recall_top_k, score_threshold=cosine_min_score,
+                             with_vectors=with_vectors)
     if not recall_chunks:
         return []
-    return rerank_client.rerank(
-        query,
-        recall_chunks,
-        top_n=rerank_top_k if rerank_top_k is not None else DEFAULT_RERANK_TOP_K,
-        min_score=rerank_min_score,
-    )
+    return rerank_client.rerank_all(query, recall_chunks, min_score=rerank_min_score)
+
+
+def build_context_line(item: Dict) -> str:
+    """一条参考资料（含来源文档名 + 章节路径 + 页码）。
+
+    - 页码为空时整段省略 `| 页码：None`（#4）；
+    - 文档名让模型知道“这条出自哪本书”，多源对比/引用归因靠它（`doc_name` 来自召回 payload）。
+    预算统计必须用同一个函数算 token，否则算出来的预算与最终 prompt 不一致。
+    """
+    meta_parts = []
+    doc_name = item.get("doc_name")
+    if doc_name:
+        meta_parts.append(f"【来源】{doc_name}")
+    meta_parts.append(f"【章节路径】{item.get('section_path')}")
+    page = item.get("page_no")
+    if page is not None:
+        meta_parts.append(f"页码：{page}")
+    return " | ".join(meta_parts) + f"\n{item.get('content') or ''}"
 
 
 def build_context_lines(chunks: List[Dict]) -> List[str]:
-    """参考资料行：章节路径 + 页码 + 正文。
-
-    页码为空时整段省略 `| 页码：None`（#4）——以前会把字面量 "None" 塞进 prompt。
-    """
-    lines = []
-    for item in chunks:
-        page = item.get("page_no")
-        meta = f"【章节路径】{item['section_path']}"
-        if page is not None:
-            meta += f" | 页码：{page}"
-        lines.append(f"{meta}\n{item['content']}")
-    return lines
+    """参考资料行列表（保持传入顺序）。"""
+    return [build_context_line(item) for item in chunks]
 
 
 def assemble_prompt(
@@ -238,26 +248,55 @@ def prepare_answer(
                 summary=getattr(memory_ctx, "summary", ""),
             )
 
-    sources = retrieve_and_rerank(
+    # 覆盖贪心需要 chunk 向量；score 策略不需要，可选省带宽
+    policy = (settings.retrieval.selector or "score").strip().lower()
+    need_vectors = policy in ("coverage", "adaptive")
+
+    candidates = retrieve_and_rerank(
         query_for_search,
         recall_top_k=recall_top_k,
-        rerank_top_k=rerank_top_k,
         cosine_min_score=cosine_min_score,
         rerank_min_score=rerank_min_score,
+        with_vectors=need_vectors,
     )
-    if not sources:
+    if not candidates:
         # 没参考资料 ⇒ 不生成：记忆段落不能代替知识库内容，否则就是编造
         return None
 
-    context_lines = trim_context(
-        build_context_lines(sources), history_to_text(history), query, memory_block
+    history_text = history_to_text(history)
+    # 预算：先算「模板 + 历史 + 问题 + 记忆段落」已占多少，剩下才是参考资料可用额度
+    reserved_tokens = window.count_tokens(
+        assemble_prompt(history_text=history_text, context="", query=query, memory_block=memory_block)
     )
+    budget = max(window.max_total_tokens - reserved_tokens, 0)
+
+    slots = int(rerank_top_k if rerank_top_k is not None else DEFAULT_RERANK_TOP_N)
+    picked, sel_stats = context_selector.select(
+        candidates,
+        slots=slots,
+        budget=budget,
+        # 预算口径必须与最终渲染一致（含来源/章节/页码前缀）
+        count_tokens=lambda item: window.count_tokens(build_context_line(item)),
+        policy=policy,
+        per_doc_max_chunk=int(settings.retrieval.per_doc_max_chunk),
+        diversity_lambda=float(settings.retrieval.diversity_lambda),
+    )
+    if not picked:
+        return None
+
+    # 参考资料顺序：lost_in_middle 把最强证据放首与末，减轻中间位置被忽略
+    ordered = context_selector.order_for_context(picked, settings.retrieval.context_order)
+    context_lines = build_context_lines(ordered)
+    # 兜底：选择器已按预算装，理论上不会丢；真超了再裁（保持原有行为）
+    context_lines = trim_context(context_lines, history_text, query, memory_block)
     context = "\n\n".join(context_lines)
 
     return PreparedAnswer(
-        prompt=assemble_prompt(history_to_text(history), context, query, memory_block),
-        sources=sources,
+        prompt=assemble_prompt(history_text, context, query, memory_block),
+        # 引用列表给前端/日志用，统一按分数降序（与 prompt 内部的 lost_in_middle 顺序无关）
+        sources=sorted(picked, key=context_selector.sort_key),
         query_for_search=query_for_search,
         memory_block=memory_block,
         memory_ctx=memory_ctx,
+        selection=sel_stats.as_dict(),
     )

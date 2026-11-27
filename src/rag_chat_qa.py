@@ -16,7 +16,7 @@ from llm_service import llm_service
 from qa_log_service import qa_log_service
 from rag_prompt import (
     DEFAULT_RECALL_TOP_K,
-    DEFAULT_RERANK_TOP_K,
+    DEFAULT_RERANK_TOP_N,
     NO_ANSWER,
 )
 from settings import settings
@@ -70,12 +70,17 @@ def _log_qa(
     query_for_search: str = None,
     no_answer: bool = False,
     memory_ctx=None,
+    selection: dict = None,
 ):
     """写问答日志（chunk_ids / rerank 分数 / doc_ids + meta）。
 
-    meta 里额外记 cosine 分数与当前阈值（#6）：事后用 SQL 看分布就能定标，
-    不需要单独的探针脚本：
+    meta 里额外记 cosine 分数与当前阈值（#6）、上下文选择的覆盖度指标：
+    事后用 SQL 看分布就能定标，不需要单独的探针脚本：
       SELECT meta->'cosine_scores', rerank_scores FROM rag_qa_log ORDER BY created_at DESC LIMIT 50;
+      -- 覆盖度：命中几篇文档、有几条因预算被丢（判断配额/窗口是否过紧）
+      SELECT meta->>'selector', meta->>'docs_selected', meta->>'docs_total',
+             meta->>'dropped_by_budget', meta->>'context_tokens'
+      FROM rag_qa_log ORDER BY created_at DESC LIMIT 50;
     """
     qa_log_service.log_qa(
         query=query,
@@ -86,7 +91,7 @@ def _log_qa(
         cost_ms=cost_ms,
         meta={
             "top_k_recall": DEFAULT_RECALL_TOP_K,
-            "top_k_rerank": DEFAULT_RERANK_TOP_K,
+            "top_k_rerank": DEFAULT_RERANK_TOP_N,
             "chat_id": chat_id,
             "stream": stream,
             # 实际用于检索的问题（多轮时可能是改写后的），方便事后排查召回问题
@@ -105,6 +110,13 @@ def _log_qa(
             "memory_recall_ids": list(getattr(memory_ctx, "recall_ids", []) or []),
             "memory_scores": list(getattr(memory_ctx, "recall_scores", []) or []),
             "summary_used": bool(getattr(memory_ctx, "summary", "")),
+            # 上下文选择：策略 / 覆盖文档数 / 预算与丢弃情况（多文档覆盖是否真的生效，全看这几个数）
+            "selection": selection or {},
+            "selector": (selection or {}).get("selector"),
+            "docs_selected": (selection or {}).get("docs_selected"),
+            "docs_total": (selection or {}).get("docs_total"),
+            "dropped_by_budget": (selection or {}).get("dropped_by_budget"),
+            "context_tokens": (selection or {}).get("context_tokens"),
         },
     )
 
@@ -215,7 +227,8 @@ def chat_qa_stream(chat_id: str, query: str, user_id: Optional[str] = None):
 
     # 7. 写入qa日志
     _log_qa(query, answer, prepared.sources, cost_ms, chat_id, stream=True,
-             query_for_search=query_for_search, memory_ctx=prepared.memory_ctx)
+             query_for_search=query_for_search, memory_ctx=prepared.memory_ctx,
+             selection=getattr(prepared, "selection", None))
 
     # 8. 异步更新记忆（摘要 + 画像）：消息已入库，任务里读到的一定是本轮完整对话
     _dispatch_memory_task(user_id, chat_id)

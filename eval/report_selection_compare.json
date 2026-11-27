@@ -1,0 +1,165 @@
+{
+  "questions": [
+    "不同教材对劳动价值论的解释有什么差异？",
+    "资本论和政治经济学对商品价值的定义有什么不同？",
+    "关于矛盾论，不同资料的说法有哪些异同？"
+  ],
+  "summary": {
+    "score": {
+      "avg_docs": 1.67,
+      "avg_chunks": 2.33,
+      "avg_tokens": 2248,
+      "unsupported_rate": 0.0,
+      "avg_ms": 57794,
+      "rows": [
+        {
+          "question": "不同教材对劳动价值论的解释有什么差异？",
+          "answer": "",
+          "chunks": 0,
+          "docs": 0,
+          "tokens": 0,
+          "unsupported": 0,
+          "note": "无参考资料",
+          "ms": 0
+        },
+        {
+          "question": "资本论和政治经济学对商品价值的定义有什么不同？",
+          "answer_len": 341,
+          "chunks": 3,
+          "docs": 2,
+          "tokens": 3025,
+          "effective": "score",
+          "unsupported": 0,
+          "ms": 66336
+        },
+        {
+          "question": "关于矛盾论，不同资料的说法有哪些异同？",
+          "answer_len": 588,
+          "chunks": 4,
+          "docs": 3,
+          "tokens": 3720,
+          "effective": "score",
+          "unsupported": 0,
+          "ms": 107045
+        }
+      ]
+    },
+    "doc_quota": {
+      "avg_docs": 1.67,
+      "avg_chunks": 2.33,
+      "avg_tokens": 2248,
+      "unsupported_rate": 0.0,
+      "avg_ms": 61309,
+      "rows": [
+        {
+          "question": "不同教材对劳动价值论的解释有什么差异？",
+          "answer": "",
+          "chunks": 0,
+          "docs": 0,
+          "tokens": 0,
+          "unsupported": 0,
+          "note": "无参考资料",
+          "ms": 0
+        },
+        {
+          "question": "资本论和政治经济学对商品价值的定义有什么不同？",
+          "answer_len": 340,
+          "chunks": 3,
+          "docs": 2,
+          "tokens": 3025,
+          "effective": "doc_quota",
+          "unsupported": 0,
+          "ms": 59163
+        },
+        {
+          "question": "关于矛盾论，不同资料的说法有哪些异同？",
+          "answer_len": 761,
+          "chunks": 4,
+          "docs": 3,
+          "tokens": 3720,
+          "effective": "doc_quota",
+          "unsupported": 0,
+          "ms": 124765
+        }
+      ]
+    },
+    "coverage": {
+      "avg_docs": 1.67,
+      "avg_chunks": 2.33,
+      "avg_tokens": 2248,
+      "unsupported_rate": 0.0,
+      "avg_ms": 53049,
+      "rows": [
+        {
+          "question": "不同教材对劳动价值论的解释有什么差异？",
+          "answer": "",
+          "chunks": 0,
+          "docs": 0,
+          "tokens": 0,
+          "unsupported": 0,
+          "note": "无参考资料",
+          "ms": 0
+        },
+        {
+          "question": "资本论和政治经济学对商品价值的定义有什么不同？",
+          "answer_len": 334,
+          "chunks": 3,
+          "docs": 2,
+          "tokens": 3025,
+          "effective": "coverage",
+          "unsupported": 0,
+          "ms": 57185
+        },
+        {
+          "question": "关于矛盾论，不同资料的说法有哪些异同？",
+          "answer_len": 609,
+          "chunks": 4,
+          "docs": 3,
+          "tokens": 3720,
+          "effective": "coverage",
+          "unsupported": 0,
+          "ms": 101961
+        }
+      ]
+    },
+    "adaptive": {
+      "avg_docs": 1.67,
+      "avg_chunks": 2.33,
+      "avg_tokens": 2248,
+      "unsupported_rate": 0.0,
+      "avg_ms": 61554,
+      "rows": [
+        {
+          "question": "不同教材对劳动价值论的解释有什么差异？",
+          "answer": "",
+          "chunks": 0,
+          "docs": 0,
+          "tokens": 0,
+          "unsupported": 0,
+          "note": "无参考资料",
+          "ms": 0
+        },
+        {
+          "question": "资本论和政治经济学对商品价值的定义有什么不同？",
+          "answer_len": 322,
+          "chunks": 3,
+          "docs": 2,
+          "tokens": 3025,
+          "effective": "coverage",
+          "unsupported": 0,
+          "ms": 56542
+        },
+        {
+          "question": "关于矛盾论，不同资料的说法有哪些异同？",
+          "answer_len": 779,
+          "chunks": 4,
+          "docs": 3,
+          "tokens": 3720,
+          "effective": "coverage",
+          "unsupported": 0,
+          "ms": 128121
+        }
+      ]
+    }
+  }
+}

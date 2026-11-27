@@ -421,27 +421,94 @@ upload:
 - **上传目录不会被提交进仓库**：`.gitignore` 已同时忽略 `src/upload_cache/` 与仓库根的 `upload_cache/`
   （历史上因为 uvicorn 与 celery 的 CWD 不同，两处都建过目录；遗留文件已挑到 `src/upload_cache/`）。
 
-### `retrieval:`：召回与重排阈值
+### `retrieval:`：召回、重排与**多文档覆盖**
 
 ```yaml
 retrieval:
-  recall_top_k: 6        # 向量召回条数
-  rerank_top_k: 3        # 重排后送给 LLM 的条数
+  recall_top_k: 6        # 平铺召回条数（仅 group_by_doc=false 时使用）
+  rerank_top_k: 12       # 送给 LLM 的槽位数
   cosine_min_score: 0.35 # 余弦下限（0 = 关闭过滤）
   rerank_min_score: 0.10 # 重排分下限（0 = 关闭过滤）
+
+  # ---- 多文档覆盖（上下文选择）----
+  group_by_doc: true     # 召回就按文档分组
+  recall_groups: 16      # 召回多少个文档组（槽位 12 + 4 组余量）
+  group_size: 2          # 每组取几条
+  rerank_batch_size: 16  # rerank 分批（TEI batch token 限制）
+  selector: "adaptive"   # score / doc_quota / coverage / adaptive
+  per_doc_max_chunk: 2   # 单文档最多几条
+  diversity_lambda: 0.3  # 冗余惩罚权重
+  context_order: "lost_in_middle"  # 最强证据放首与末
 ```
 
-- 修复前**没有任何分数阈值**：向量相似度再低也算召回、重排分再差也塞进 prompt，
-  “未找到相关资料”几乎不会触发，幻觉主要来自这里。
-- 默认值依据：`bge-reranker-v2-m3` 官方模型卡的实例分数里，相关对 ≈ 0.99，不相关对 ≈ 0.0003~0.004
-  ⇒ `0.10` 在“不相关带”之上、临界带之下；`bge-m3` 的余弦分布很压缩（不相关的中文长块常见
-  0.30~0.40，相关长块 0.45~0.65）⇒ `0.35` 只剪“明显无关”。
-  （网上常见的 `similarity=0.70` 是按 OpenAI 系 embedding 标定的，用在 bge-m3 上会把召回卡死，没采用。）
-- 调法：两个值都是“下限”，调成 `0` 即关掉过滤；调高则更多提问回答 `NO_ANSWER`。
-  事后从日志表看真实分布再定标：`rag_qa_log.meta.cosine_scores`（召回分数）、
-  `meta.thresholds`（当时生效的阈值）、`meta.no_answer`（未命中比例）。
-- 接口没变：`/chat`、`/chat/stream`、`/qa`、`eval/rag_eval.py` 都不用改；
-  阈值只影响“要不要把这段资料交给 LLM”。
+- **阈值部分（问题 A：噪声多）**：修复前**没有任何分数阈值**，向量相似度再低也算召回、重排分再差也塞进 prompt，
+  “未找到相关资料”几乎不会触发。默认值依据：`bge-reranker-v2-m3` 官方模型卡实例分数里，相关对 ≈ 0.99，
+  不相关对 ≈ 0.0003~0.004 ⇒ `0.10` 在“不相关带”之上；`bge-m3` 余弦分布很压缩（不相关 0.30~0.40，
+  相关 0.45~0.65）⇒ `0.35` 只剪“明显无关”。（社区常见的 0.70 是按 OpenAI 系模型标定的，用在 bge-m3 上会把召回卡死。）
+  调成 `0` 即关掉过滤；调高则更多提问回答 `NO_ANSWER`。
+- **覆盖部分（问题 B：有效信息太多）**：两类问题不要混。实测：普通召回 `limit=40` 时，40 个点**只来自 3 篇文档**，
+  其余几十篇文档在召回阶段就没了，rerank 之后再怎么排也救不回来。开启 `group_by_doc` 后，同样耗时
+  （0.04~0.09s）能把 12 个槽位铺到 12 篇文档上。
+
+#### 四种选择策略
+
+| `selector` | 行为 | 什么时候用 |
+|---|---|---|
+| `score` | 旧行为，纯分数截断 | 基线 / 一键回退（`selector: score` 即恢复改动前的选片行为） |
+| `doc_quota` | 按文档配额两遍填充：先每文档 1 条铺满，再补第 2 条 | 对照实验 |
+| `coverage` | 冗余感知贪心 `gain = 分数 − λ·与已选的最大相似度`，配合 token 预算与单文档上限 | 语料是“多版本教材”、同一知识点反复讲 |
+| **`adaptive`（默认）** | 候选里有效文档数 ≥ 槽位 ⇒ 走 `score`；否则走 `coverage` | 生产默认 |
+
+`adaptive` 不是玄学：文献（arXiv 2610.09412）用受控实验表明**多样化在“干净”候选池上反而降低相关性、
+证据覆盖率与答案质量**，只在候选池本身冗余、且任务需要多条证据时才有收益。所以这里只在
+“top-槽位里不同文档数不足”时才启用配额/覆盖，单证据查询（答案集中在一本书里）不会被误伤。
+
+#### 为什么必须预算感知
+
+`chat_window.trim_context()` 是“遇到第一个装不下的就 break” ⇒ 以前选 12 条但窗口只装得下 10 条时，
+会**静默丢掉最低分的那几篇**（正好把多源覆盖的收益吃掉）。现在选择阶段就按 token 累加，装不下的
+直接不选，并在日志里记 `dropped_by_budget`。`chat.history_ratio` 给历史单独设上限，避免历史把资料预算吃光。
+
+#### 调参口径
+
+```sql
+-- 本次命中几篇文档、有没有被预算卡住、上下文用了多少 token
+SELECT created_at, meta->>'selector' AS sel, meta->>'docs_selected' AS docs_sel,
+       meta->>'docs_total' AS docs_tot, meta->>'dropped_by_budget' AS drop_budget,
+       meta->>'context_tokens' AS ctx_tokens
+FROM rag_qa_log ORDER BY created_at DESC LIMIT 50;
+```
+
+- `docs_selected` 长期远小于 `docs_total` 且 `dropped_by_budget > 0` ⇒ 预算不够：调大
+  `chat.max_total_tokens`（同时要改 ollama `num_ctx`）或减少槽位。
+- 答案出现“张冠李戴/串书” ⇒ `diversity_lambda` 太大或 `per_doc_max_chunk` 太小，调小/调大各试。
+- 回答变短变频繁“未找到” ⇒ 阈值在大，不是选择策略的问题；先把 `rerank_min_score` 调回 0.10 看分布。
+
+#### 上下文窗口：`max_total_tokens` 必须 ≤ 模型真实 `num_ctx`
+
+`chat.max_total_tokens` 默认 **16384**（12 条 × 700 token ≈ 8.3k + 历史 4k + 模板/问题/记忆 ≈1k）。
+
+⚠ **实测坑**：ollama 默认 `num_ctx` 只有 **4096**（`/api/ps` 可直接看到），而 tiktoken 估的 8192 是“假窗口”：
+超出部分被 ollama **静默截断**。用“针在开头”脚本测过：5.5k token 还能答出开头的暗号，8k 就丢了。
+把它提到 16384 的做法（不动原模型、不重启服务）：
+
+```bash
+printf 'FROM qwen2.5:latest\nPARAMETER num_ctx 16384\n' > Modelfile.rag16k
+ollama create qwen2.5-16k -f Modelfile.rag16k
+# 然后把 config.yaml 的 llm.model_name 改成 qwen2.5-16k
+```
+
+验证：
+
+```bash
+# 应看到 16384
+curl -s http://127.0.0.1:11434/api/ps | python -c "import json,sys;print([m['context_length'] for m in json.load(sys.stdin)['models']])"
+```
+
+（显存/延迟撑不住 16k 时降级：`max_total_tokens: 8192`、`rerank_top_k: 8`、`recall_groups: 12`；
+选择器本身预算感知，会自动少装而不是报错。）
+
+### `docling_parser.enable_page_no`：页码（默认关闭）
 
 ### `docling_parser.enable_page_no`：页码（默认关闭）
 
@@ -494,7 +561,7 @@ memory:
   总开关开着但子开关全关时会带 ⚠ 提醒（否则就是个静默空转）。
 
 配套改动：`chat.max_total_tokens` 从 `4096` 提到 **`8192`**（多了一段记忆要算进预算）。
-⚠ 用本地 ollama 时要把 `num_ctx` 提到 ≥ 8192，否则 prompt 会被静默截断。
+⚠ 用本地 ollama 时要把 `num_ctx` 提到 ≥ `max_total_tokens`（默认 16384），否则 prompt 会被静默截断。
 
 ### 切块行为修正 2：正文结构不再被压平、大表按行切并重复表头
 
@@ -591,7 +658,7 @@ memory:
 
 - `chat.max_total_tokens` = `8192`；记忆段落计入 `trim_context()` 的 reserved，
   所以它只会挤掉参考资料，不会把 prompt 顶到模型上限外面。
-- ⚠ 本地 ollama 必须把 `num_ctx` 提到 ≥ 8192，否则多余部分被 ollama **静默截断**，
+- ⚠ 本地 ollama 必须把 `num_ctx` 提到 ≥ `chat.max_total_tokens`（默认 16384），否则多余部分被 ollama **静默截断**，
   表现是“答非所问”而不是报错。
 
 ### 成本与队律

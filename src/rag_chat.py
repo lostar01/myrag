@@ -17,7 +17,7 @@ import memory_service
 import rag_prompt
 from llm_service import llm_service
 from qa_log_service import qa_log_service
-from rag_prompt import DEFAULT_RECALL_TOP_K, DEFAULT_RERANK_TOP_K, NO_ANSWER
+from rag_prompt import DEFAULT_RECALL_TOP_K, DEFAULT_RERANK_TOP_N, NO_ANSWER
 from settings import settings
 
 
@@ -52,7 +52,7 @@ def rag_chat(query: str, chat_id: Optional[str] = None, user_id: Optional[str] =
         cost_ms=cost_ms,
         meta={
             "top_k_recall": DEFAULT_RECALL_TOP_K,
-            "top_k_rerank": DEFAULT_RERANK_TOP_K,
+            "top_k_rerank": DEFAULT_RERANK_TOP_N,
             # 与线上日志保持一致的分数/阈值字段，方便用 eval 结果定标（#6）
             "cosine_scores": [item.get("score") for item in sources],
             "thresholds": {
@@ -62,6 +62,10 @@ def rag_chat(query: str, chat_id: Optional[str] = None, user_id: Optional[str] =
             # 开记忆 A/B 时方便对比：本次注入了哪些记忆条目
             "memory_profile_ids": list(getattr(prepared.memory_ctx, "profile_ids", []) or []),
             "memory_recall_ids": list(getattr(prepared.memory_ctx, "recall_ids", []) or []),
+            # 上下文选择：覆盖了几篇文档、预算是否够（eval 对比时看这几个数）
+            "selection": getattr(prepared, "selection", None) or {},
+            "selector": (getattr(prepared, "selection", None) or {}).get("selector"),
+            "docs_selected": (getattr(prepared, "selection", None) or {}).get("docs_selected"),
         },
     )
 
